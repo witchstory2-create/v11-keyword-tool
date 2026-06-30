@@ -1,5 +1,8 @@
 name: build-exe
 
+permissions:
+  contents: write
+
 on:
   release:
     types: [published]
