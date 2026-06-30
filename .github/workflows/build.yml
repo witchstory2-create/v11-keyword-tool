@@ -29,7 +29,7 @@ jobs:
 
     - name: Build EXE
       run: |
-        python -m PyInstaller --clean --onefile keyword_tool.py
+      python -m PyInstaller --clean --onefile --windowed keyword_tool.py
 
     - name: Upload EXE to Release
       uses: softprops/action-gh-release@v1
