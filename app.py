@@ -1,5 +1,5 @@
 # app.py
-# v16.5 - 이슈 수익형 블로그 글 추천기 (실질 수익 추정 반영)
+# v16.6 - 이슈 수익형 블로그 글 추천기 (광고 경쟁도 배율 / 실질 수익 추정 반영)
 
 import csv
 import threading
@@ -19,6 +19,8 @@ from config_manager import save_config, load_config
 analysis_results = []
 queue_items = []
 
+
+# ---------------------- 설정 저장/불러오기 ----------------------
 
 def load_saved_config():
     cfg = load_config()
@@ -42,6 +44,8 @@ def on_close():
     save_current_config()
     root.destroy()
 
+
+# ---------------------- 분석 로직 ----------------------
 
 def run_analysis_thread():
     analyze_button.config(state="disabled")
@@ -84,6 +88,8 @@ def run_analysis():
             data = get_keyword_data(kw, cid, api, secret)
             if data:
                 for item in data[:5]:
+                    # meta: collector.py가 만든 후보 정보 (첫 번째)
+                    # item: 네이버 API가 돌려준 검색량/경쟁도/광고깊이/CTR 정보 (두 번째)
                     scored = score_keyword(meta, item)
                     results.append(scored)
         except Exception as e:
@@ -115,17 +121,21 @@ def run_analysis():
     def finalize():
         tree.delete(*tree.get_children())
         for r in unique_results[:150]:
+            depth_display = f"x{r['ad_depth_multiplier']}" + (" ⭐" if r.get("low_search_high_value") else "")
             tree.insert("", "end", values=(
-                r["keyword"], r["pc"], r["mobile"], r["competition"],
+                r["keyword"], r["pc"], r["mobile"], r["competition"], depth_display,
                 r["issue_score"], r["profit_score"], f"{r['estimated_revenue_krw']:,.0f}",
                 r["final_score"], r["type"], r["difficulty"]
             ))
         status.config(text=f"완료: {len(unique_results)}개 분석 / API 오류 {error_count}개")
+        # 비수익 카테고리는 제외하고 진짜 애드포스트 수익형 TOP5만 큐에 반영
         build_queue(filter_top5(unique_results))
         analyze_button.config(state="normal")
 
     root.after(0, finalize)
 
+
+# ---------------------- 제목/개요 상세 보기 ----------------------
 
 def show_titles():
     selected = tree.selection()
@@ -135,7 +145,9 @@ def show_titles():
 
     values = tree.item(selected[0], "values")
     keyword = values[0]
-    difficulty = values[9] if len(values) > 9 else "보통"
+    # 컬럼 순서: keyword(0) pc(1) mobile(2) competition(3) addepth(4)
+    #            issue(5) profit(6) revenue(7) final(8) type(9) difficulty(10)
+    difficulty = values[10] if len(values) > 10 else "보통"
     render_keyword_detail(keyword, difficulty)
 
 
@@ -169,6 +181,8 @@ def run_draft_writing(keyword, outline, difficulty):
     status.config(text="글 초안 작성 완료. 클립보드 복사 버튼으로 바로 복사할 수 있습니다.")
 
 
+# ---------------------- 오늘의 TOP5 작성 큐 ----------------------
+
 def build_queue(top5):
     global queue_items
     queue_items = []
@@ -179,6 +193,8 @@ def build_queue(top5):
             "final_score": item["final_score"],
             "difficulty": item["difficulty"],
             "estimated_revenue_krw": item["estimated_revenue_krw"],
+            "ad_depth_multiplier": item["ad_depth_multiplier"],
+            "low_search_high_value": item["low_search_high_value"],
             "reason": item["reasons"],
             "status": "미작성",
         })
@@ -200,9 +216,12 @@ def render_queue():
 
         star = "★" * max(1, min(5, int(q["final_score"] // 20)))
         status_icon = {"미작성": "☐", "작성완료": "☑", "발행완료": "✅"}.get(q["status"], "☐")
+        hidden_gem = " ⭐숨은고수익" if q.get("low_search_high_value") else ""
         header = (f"{q['rank']}위  {q['keyword']}   {star}   난이도: {q['difficulty']}   "
-                   f"예상수익: {q['estimated_revenue_krw']:,.0f}원   {status_icon} {q['status']}")
-        tk.Label(row, text=header, font=("맑은 고딕", 11, "bold"), anchor="w").pack(fill="x", padx=6, pady=2)
+                   f"예상수익: {q['estimated_revenue_krw']:,.0f}원{hidden_gem}   "
+                   f"{status_icon} {q['status']}")
+        tk.Label(row, text=header, font=("맑은 고딕", 11, "bold"), anchor="w",
+                 wraplength=560, justify="left").pack(fill="x", padx=6, pady=2)
 
         reason_text = "   ".join(f"✔ {r}" for r in q["reason"])
         tk.Label(row, text=reason_text, fg="gray20", anchor="w",
@@ -223,6 +242,8 @@ def mark_status(q, new_status):
     save_queue(queue_items)
     render_queue()
 
+
+# ---------------------- 내보내기 ----------------------
 
 def copy_to_clipboard():
     root.clipboard_clear()
@@ -247,19 +268,23 @@ def save_as_csv():
         return
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["키워드", "PC", "모바일", "경쟁도", "이슈점수", "수익점수",
-                          "예상수익(원)", "최종점수", "유형", "난이도"])
+        writer.writerow(["키워드", "PC", "모바일", "경쟁도", "광고배율", "이슈점수", "수익점수",
+                          "예상수익(원)", "최종점수", "유형", "난이도", "숨은고수익여부"])
         for r in analysis_results:
             writer.writerow([r["keyword"], r["pc"], r["mobile"], r["competition"],
+                              f"x{r['ad_depth_multiplier']}",
                               r["issue_score"], r["profit_score"],
                               f"{r['estimated_revenue_krw']:,.0f}",
-                              r["final_score"], r["type"], r["difficulty"]])
+                              r["final_score"], r["type"], r["difficulty"],
+                              "예" if r.get("low_search_high_value") else ""])
     status.config(text=f"CSV 저장 완료: {path}")
 
 
+# ---------------------- UI 구성 ----------------------
+
 root = tk.Tk()
 root.title("v16 이슈 수익형 블로그 글 추천기")
-root.geometry("1450x850")
+root.geometry("1500x850")
 
 title_label = tk.Label(root, text="v16 이슈 수익형 블로그 글 추천기", font=("맑은 고딕", 17, "bold"))
 title_label.pack(pady=8)
@@ -316,20 +341,22 @@ main_pane.pack(fill="both", expand=True, padx=15, pady=8)
 left_frame = tk.Frame(main_pane)
 main_pane.add(left_frame, weight=3)
 
-columns = ("keyword", "pc", "mobile", "competition", "issue", "profit", "revenue", "final", "type", "difficulty")
+columns = ("keyword", "pc", "mobile", "competition", "addepth",
+           "issue", "profit", "revenue", "final", "type", "difficulty")
 tree = ttk.Treeview(left_frame, columns=columns, show="headings", height=25)
 
 headers = {
     "keyword": "키워드", "pc": "PC", "mobile": "모바일", "competition": "경쟁도",
-    "issue": "이슈점수", "profit": "수익점수", "revenue": "예상수익(원)",
-    "final": "최종점수", "type": "유형", "difficulty": "난이도"
+    "addepth": "광고배율", "issue": "이슈점수", "profit": "수익점수",
+    "revenue": "예상수익(원)", "final": "최종점수", "type": "유형", "difficulty": "난이도"
 }
 for col in columns:
     tree.heading(col, text=headers[col])
-    tree.column(col, width=85)
-tree.column("keyword", width=200)
+    tree.column(col, width=80)
+tree.column("keyword", width=190)
 tree.column("type", width=100)
-tree.column("revenue", width=100)
+tree.column("revenue", width=95)
+tree.column("addepth", width=85)
 
 tree.pack(fill="both", expand=True)
 tree.bind("<<TreeviewSelect>>", lambda e: show_titles())
@@ -337,10 +364,10 @@ tree.bind("<<TreeviewSelect>>", lambda e: show_titles())
 right_pane = ttk.PanedWindow(main_pane, orient="vertical")
 main_pane.add(right_pane, weight=4)
 
-queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐 (예상 수익 기준)")
+queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐 (예상 수익 기준, ⭐=숨은 고수익 키워드)")
 right_pane.add(queue_outer, weight=1)
 
-queue_canvas = tk.Canvas(queue_outer, height=260)
+queue_canvas = tk.Canvas(queue_outer, height=280)
 queue_scrollbar = tk.Scrollbar(queue_outer, orient="vertical", command=queue_canvas.yview)
 queue_inner = tk.Frame(queue_canvas)
 
@@ -359,6 +386,9 @@ detail_box.pack(fill="both", expand=True, padx=4, pady=4)
 
 status = tk.Label(root, text="대기 중")
 status.pack(pady=5)
+
+
+# ---------------------- 시작 시 설정/큐 복원 ----------------------
 
 load_saved_config()
 
