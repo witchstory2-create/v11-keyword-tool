@@ -1,32 +1,44 @@
 # -*- coding: utf-8 -*-
 """
-collector.py (v18.5)
+collector.py (v18.6)
 네이버 블로그 수익형 키워드 발굴 시스템 - 후보 수집/정제 전담 모듈
+
+[v18.6 변경 사항 - 정치/국제/연예/스포츠/학교 맥락 오프토픽 기사 제외]
+기존 노이즈 블랙리스트(언론사명, 지역명, 날짜, 인물호칭, 영어잔재어)는 개별
+"토큰" 단위로 걸러냈지만, 앵커(예: "지원금", "보험") 자체는 정치/연예 기사에서도
+언급될 수 있어 이 방식만으로는 걸러지지 않았다. 예를 들어 "여당이 재난지원금
+지급안을 발표했다"라는 정치 기사에서도 앵커 "지원금"이 그대로 매칭되어
+시사성 키워드가 후보로 섞여 들어오는 문제가 있었다.
+
+v18.6부터는 기사 단위로 OFFTOPIC_CONTEXT_WORDS(정치/국제/연예/스포츠/학교
+맥락어)가 함께 등장하는지 먼저 확인하고, 하나라도 발견되면 그 기사에서는
+후보를 전혀 추출하지 않는다(기사 자체를 건너뜀). 정상적인 수익형 기사 처리
+로직, 출력 계약(필드명), 앵커/의도어 정의, 병렬 처리 구조는 전혀 변경하지
+않았다.
 
 [역할]
   - 무작위 뉴스 수집이 아니라, 수익형 카테고리별 시드 쿼리로만 네이버 뉴스를 조회.
   - HTML 엔티티, 언론사명, 날짜, 지역명, 인물 호칭 등 일반 뉴스 노이즈를 원천 차단.
+  - [v18.6 신규] 정치/국제/연예/스포츠/학교 맥락이 섞인 기사는 후보 추출 대상에서 제외.
   - 카테고리 앵커(anchor) + 검색의도어(intent word) 조합으로 후보 키워드를 생성.
   - 수익성 판단(profit_filter)이나 점수화(scorer)는 이 파일의 책임이 아님.
     여기서는 "깨끗하고 카테고리가 명확한 후보"만 만들어서 넘긴다.
 
 [출력 계약] collect_candidates()가 반환하는 리스트의 각 원소(dict)는
   아래 필드를 반드시 포함한다. 이후 모든 다운스트림 모듈은 이 필드명을 그대로 사용한다.
+  (v18.5와 완전히 동일 - 변경 없음)
 
     {
-        "keyword"       : str   # 후보 키워드 (예: "민생지원금", "자동차보험 갱신")
-        "category"      : str   # 소속 수익형 카테고리 (예: "지원금")
-        "anchor"        : str   # 이 후보가 매칭된 카테고리 앵커 원형 (예: "지원금")
-        "intent_word"   : str|None  # 함께 검출된 검색의도어 (예: "신청방법"), 없으면 None
-        "mentions"      : int   # 이 키워드가 등장한 서로 다른 뉴스 기사 수
-        "sample_titles" : list[str]  # 근거가 된 원문 기사 제목 샘플 (최대 5개, 정제 후)
-        "seed_query"    : str   # 이 후보를 발견한 시드 검색어
-        "first_pub_date": str   # 최초 발견 기사 발행일 (YYYY-MM-DD, 알 수 없으면 "")
-        "latest_pub_date": str  # 최근 발견 기사 발행일 (YYYY-MM-DD, 알 수 없으면 "")
+        "keyword"       : str
+        "category"      : str
+        "anchor"        : str
+        "intent_word"   : str|None
+        "mentions"      : int
+        "sample_titles" : list[str]
+        "seed_query"    : str
+        "first_pub_date": str
+        "latest_pub_date": str
     }
-
-  이 필드 외의 값(검색량, 문서수, DataLab, 점수, 등급 등)은 여기서 절대 만들지 않는다.
-  실측치 조회와 판단은 profit_filter.py / scorer.py의 책임이다.
 
 표준 라이브러리만 사용 (urllib, json, re, html, time, datetime, concurrent.futures)
 -> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
@@ -41,12 +53,8 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 # =========================================================================
-# 1. 수익형 카테고리 시드 & 앵커 정의
+# 1. 수익형 카테고리 시드 & 앵커 정의 (v18.5와 완전히 동일 - 변경 없음)
 # =========================================================================
-# anchors : 이 카테고리에 속한다고 판단할 "핵심 원형 단어" 목록.
-#           후보 토큰이 이 anchor를 포함하고 있어야 후보로 채택된다.
-# seeds   : 실제 네이버 뉴스 API에 보낼 검색어. anchor보다 구체적으로 잡아서
-#           카테고리 무관 뉴스가 섞여 들어올 확률을 낮춘다.
 CATEGORY_SEEDS = {
     "지원금": {
         "anchors": ["지원금", "지원비", "생계비", "생계지원"],
@@ -105,8 +113,6 @@ CATEGORY_SEEDS = {
     },
 }
 
-# 검색의도어: 후보 키워드가 "정보 검색성"임을 뒷받침하는 접미어.
-# anchor 토큰 옆에 이 단어가 붙어 있으면 별도 bigram 후보로도 채택한다.
 INTENT_WORDS = [
     "신청", "신청방법", "신청기간", "신청조건", "대상", "대상자", "조건",
     "자격", "방법", "금액", "한도", "지급일", "지급대상", "확인", "조회",
@@ -114,7 +120,7 @@ INTENT_WORDS = [
 ]
 
 # =========================================================================
-# 2. 노이즈 블랙리스트
+# 2. 노이즈 블랙리스트 (v18.5와 동일)
 # =========================================================================
 PRESS_NAMES = [
     "연합뉴스", "조선일보", "중앙일보", "동아일보", "한겨레", "경향신문",
@@ -142,24 +148,20 @@ DATE_STOPWORDS = [
     "상반기", "하반기", "1분기", "2분기", "3분기", "4분기",
 ]
 
-# 뉴스 편집/형식 관련 상용어 (기사 제목에서 흔히 붙는 라벨성 단어)
 GENERIC_NEWS_WORDS = [
     "속보", "단독", "종합", "영상", "포토", "인터뷰", "사설", "칼럼",
     "오피니언", "이슈", "화제", "리포트", "특보", "브리핑", "논평",
     "기자수첩", "사진", "그래픽",
 ]
 
-# HTML 엔티티 잔재/영어 잡음
 ENGLISH_STOPWORDS = [
     "and", "the", "of", "quot", "amp", "nbsp", "com", "co", "kr",
     "http", "https", "www", "news", "article", "html",
 ]
 
-# 인물 호칭 접미어 -> 이 접미어가 붙은 토큰은 인물 언급으로 간주해 제거
 PERSON_SUFFIXES = ["씨", "대표", "의원", "시장", "지사", "총리", "장관",
                     "청장", "국장", "회장", "위원장", "교수", "박사"]
 
-# 조사/어미 등 흔한 한국어 접미(단순 규칙 기반 어절 정리용)
 PARTICLE_SUFFIXES = [
     "으로부터", "에서부터", "까지도", "이라도", "에서는", "에게서",
     "으로는", "부터는", "에서", "으로", "에게", "까지", "부터", "이라",
@@ -167,6 +169,43 @@ PARTICLE_SUFFIXES = [
     "이는", "은는", "이에", "에는", "이랑", "이며", "하고",
     "은", "는", "이", "가", "을", "를", "의", "에", "도", "만", "과", "와", "로",
 ]
+
+# =========================================================================
+# [v18.6 신규] 정치/국제/연예/스포츠/학교 맥락어
+# -------------------------------------------------------------------------
+# 앵커 자체는 매칭되지만, 기사 전체 맥락이 아래 카테고리에 해당하면
+# 수익형 정보 검색 의도가 아닌 시사성/화제성 기사로 판단해 후보 추출을
+# 아예 건너뛴다. 필요 시 이 목록만 추가/조정하면 되고, 다른 로직은
+# 변경할 필요가 없다.
+# =========================================================================
+OFFTOPIC_CONTEXT_WORDS = {
+    "정치": [
+        "정치", "국회", "여당", "야당", "정당", "총선", "대선", "국정감사",
+        "탄핵", "청와대", "정상회담", "국무총리", "대통령실", "당대표",
+        "원내대표", "정국", "여야", "국정운영", "개헌", "특검",
+    ],
+    "국제": [
+        "국제", "외신", "특파원", "유엔", "나토", "정상회담", "순방",
+        "외교부", "주한미군", "국제사회", "다자외교", "국제기구",
+    ],
+    "연예": [
+        "연예", "배우", "가수", "아이돌", "드라마", "예능", "콘서트",
+        "컴백", "열애", "결혼발표", "스캔들", "소속사", "팬미팅",
+        "뮤직비디오", "발라드", "걸그룹", "보이그룹",
+    ],
+    "스포츠": [
+        "스포츠", "축구", "야구", "농구", "배구", "올림픽", "월드컵",
+        "경기결과", "감독", "국가대표", "리그", "챔피언스리그", "메달",
+        "프로야구", "프로축구",
+    ],
+    "학교": [
+        "수능", "입시", "초등학교", "중학교", "고등학교", "교육부",
+        "학생회", "대학입시", "수시", "정시", "교권", "학교폭력",
+    ],
+}
+_OFFTOPIC_FLAT = set()
+for _words in OFFTOPIC_CONTEXT_WORDS.values():
+    _OFFTOPIC_FLAT.update(_words)
 
 BRACKET_PATTERN = re.compile(r"[\[\(【〔《][^\]\)】〕》]*[\]\)】〕》]")
 DATE_NUMERIC_PATTERN = re.compile(
@@ -181,10 +220,9 @@ PURE_NUMBER_PATTERN = re.compile(r"^\d+[%원]?$")
 
 
 # =========================================================================
-# 3. 텍스트 정제 함수
+# 3. 텍스트 정제 함수 (v18.5와 동일)
 # =========================================================================
 def _clean_title(raw_title):
-    """HTML 엔티티/태그 제거, 언론사 접미사 제거, 날짜/괄호 표현 제거."""
     if not raw_title:
         return ""
     text = html.unescape(raw_title)
@@ -197,7 +235,6 @@ def _clean_title(raw_title):
 
 
 def _strip_particle(word):
-    """어절 끝의 조사를 단순 규칙으로 제거. 제거 후 길이가 너무 짧아지면 원형 유지."""
     for suf in PARTICLE_SUFFIXES:
         if word.endswith(suf) and len(word) - len(suf) >= 2:
             return word[: -len(suf)]
@@ -212,7 +249,6 @@ def _is_person_name_token(token):
 
 
 def _is_meaningless_token(token):
-    """노이즈 토큰 여부를 다층 블랙리스트와 패턴으로 판별."""
     if not token or len(token) < 2:
         return True
     low = token.lower()
@@ -227,16 +263,13 @@ def _is_meaningless_token(token):
     if PURE_NUMBER_PATTERN.match(token):
         return True
     if re.fullmatch(r"[a-zA-Z]+", token) and len(token) <= 3:
-        # 짧은 영어 잔재어(and, is, to 등) 차단
         return True
     if NON_KOR_ENG_NUM_PATTERN.search(token):
-        # 특수문자/이모지 등이 남아있는 경우
         return True
     return False
 
 
 def _tokenize(cleaned_title):
-    """정제된 제목을 어절 단위로 분리하고 조사를 제거한 뒤 노이즈 토큰을 제거."""
     raw_words = cleaned_title.split(" ")
     tokens = []
     for w in raw_words:
@@ -251,14 +284,24 @@ def _tokenize(cleaned_title):
 
 
 # =========================================================================
-# 4. 후보 키워드 추출 (앵커 + 검색의도어 조합)
+# [v18.6 신규] 오프토픽 맥락 판별
+# =========================================================================
+def _has_offtopic_context(tokens):
+    """
+    토큰 목록(조사 제거 전 원본도 함께 넘겨받는 것이 이상적이나, 여기서는
+    이미 노이즈가 제거된 tokens 기준으로 OFFTOPIC_CONTEXT_WORDS와의 교집합을
+    확인한다. 정치/국제/연예/스포츠/학교 맥락어가 하나라도 있으면 True.
+    """
+    for tok in tokens:
+        if tok in _OFFTOPIC_FLAT:
+            return True
+    return False
+
+
+# =========================================================================
+# 4. 후보 키워드 추출 (앵커 + 검색의도어 조합) - v18.5와 동일
 # =========================================================================
 def _extract_candidates_from_tokens(tokens, category, anchors):
-    """
-    토큰 리스트에서 카테고리 앵커를 포함한 후보를 뽑는다.
-      1) 앵커를 포함하는 단일 토큰 자체가 이미 복합어인 경우 (예: "민생지원금") -> 단독 후보.
-      2) 앵커 토큰과 인접한 검색의도어가 있는 경우 -> "앵커어 의도어" bigram 후보 추가.
-    """
     candidates = []
     n = len(tokens)
     for i, tok in enumerate(tokens):
@@ -266,10 +309,8 @@ def _extract_candidates_from_tokens(tokens, category, anchors):
         if not matched_anchor:
             continue
 
-        # (1) 단독 복합어 후보
         candidates.append({"keyword": tok, "anchor": matched_anchor, "intent_word": None})
 
-        # (2) 인접 토큰이 검색의도어인 경우 bigram 후보
         for j in (i - 1, i + 1):
             if 0 <= j < n:
                 neighbor = tokens[j]
@@ -287,7 +328,6 @@ def _extract_candidates_from_tokens(tokens, category, anchors):
 
 
 def _parse_pub_date(raw_pub_date):
-    """네이버 뉴스 API의 pubDate(RFC822 유사 포맷)를 YYYY-MM-DD로 변환. 실패 시 빈 문자열."""
     if not raw_pub_date:
         return ""
     for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"):
@@ -303,12 +343,6 @@ def _parse_pub_date(raw_pub_date):
 # 5. 뉴스 조회 (카테고리 시드 단위)
 # =========================================================================
 def _fetch_seed_news(search_api, seed_query, pages=2, display=100, log=None):
-    """
-    하나의 시드 쿼리에 대해 네이버 뉴스 API를 조회.
-    search_api는 naver_search_api.NaverSearchAPI 인스턴스를 가정하며,
-    search_news(query, display, start, sort) -> list[dict(title, description, pubDate, link)]
-    형태의 메서드를 제공한다고 가정한다.
-    """
     items = []
     for page in range(pages):
         start = page * display + 1
@@ -323,14 +357,20 @@ def _fetch_seed_news(search_api, seed_query, pages=2, display=100, log=None):
             if log:
                 log(f"[collector] 뉴스 조회 실패 (seed='{seed_query}', page={page}): {e}")
             break
-        time.sleep(0.15 + random.random() * 0.15)  # API 과호출 방지용 소폭 지연
+        time.sleep(0.15 + random.random() * 0.15)
     return items
 
 
 def _process_seed(search_api, category, seed_query, anchors, log=None):
-    """시드 쿼리 하나를 처리하여 (category, seed_query, 후보 리스트, 원문기사 메타)를 반환."""
+    """
+    [v18.6 수정] 기사 단위로 오프토픽 맥락 여부를 먼저 확인하고,
+    해당되면 이 기사에서는 후보를 만들지 않고 건너뛴다(offtopic_skipped 집계).
+    나머지 정상 처리 흐름은 v18.5와 동일하다.
+    """
     news_items = _fetch_seed_news(search_api, seed_query, log=log)
-    local_agg = {}  # keyword -> {"mentions":set(article_id), "sample_titles":[], "anchor", "intent_word", pub dates}
+    local_agg = {}
+    offtopic_skipped = 0
+    empty_skipped = 0
 
     for item in news_items:
         raw_title = item.get("title", "")
@@ -342,10 +382,17 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
         cleaned_desc = _clean_title(raw_desc)
         combined_text = f"{cleaned_title} {cleaned_desc}".strip()
         if not combined_text:
+            empty_skipped += 1
             continue
 
         tokens = _tokenize(combined_text)
         if not tokens:
+            empty_skipped += 1
+            continue
+
+        # [v18.6 신규] 정치/국제/연예/스포츠/학교 맥락이면 이 기사는 통째로 건너뜀
+        if _has_offtopic_context(tokens):
+            offtopic_skipped += 1
             continue
 
         found = _extract_candidates_from_tokens(tokens, category, anchors)
@@ -367,7 +414,6 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
             entry["mentions_set"].add(link)
             if cleaned_title and cleaned_title not in entry["sample_titles"] and len(entry["sample_titles"]) < 5:
                 entry["sample_titles"].append(cleaned_title)
-            # intent_word가 있는 후보를 우선(더 구체적인 정보이므로) 갱신
             if cand["intent_word"] and not entry["intent_word"]:
                 entry["intent_word"] = cand["intent_word"]
             if pub_date:
@@ -376,7 +422,12 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
                 if not entry["latest_pub_date"] or pub_date > entry["latest_pub_date"]:
                     entry["latest_pub_date"] = pub_date
 
-    return local_agg
+    if log and (offtopic_skipped > 0):
+        log(f"[collector] category='{category}', seed='{seed_query}': "
+            f"오프토픽(정치/국제/연예/스포츠/학교) 기사 {offtopic_skipped}건 제외, "
+            f"본문없음 {empty_skipped}건 제외")
+
+    return local_agg, offtopic_skipped, empty_skipped, len(news_items)
 
 
 # =========================================================================
@@ -385,26 +436,9 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
 def collect_candidates(search_api, discovery_target=None, light_filter_target=None,
                         log=None, max_workers=4, max_per_category=60):
     """
-    수익형 카테고리 뉴스를 수집하고, 노이즈를 제거한 후보 키워드 리스트를 반환한다.
-
-    Parameters
-    ----------
-    search_api : naver_search_api.NaverSearchAPI
-        뉴스 검색을 수행할 API 클라이언트. search_news(query, display, start, sort) 필요.
-    discovery_target : list[str] | None
-        수집 대상 카테고리 이름 목록. None이면 CATEGORY_SEEDS의 전체 카테고리를 사용.
-    light_filter_target : list[str] | None
-        추가로 포함하고 싶은 보조 시드 키워드 목록(선택). 각 카테고리에 매칭되는 항목만 반영.
-    log : callable | None
-        로그 출력 콜백. log(message:str) 형태.
-    max_workers : int
-        시드 쿼리 병렬 조회 스레드 수.
-    max_per_category : int
-        카테고리별로 반환할 최대 후보 수(멘션 수 기준 상위 N개). 다운스트림 부담 완화용.
-
-    Returns
-    -------
-    list[dict] : 위 "출력 계약"에 정의된 필드를 가진 후보 딕셔너리 리스트.
+    [v18.6] 반환값의 필드 구조는 v18.5와 완전히 동일하다(호환성 유지).
+    이번 버전에서 추가된 것은 오프토픽 기사 제외 로직과, 그로 인한
+    집계 로그(전체 조회 기사 수, 오프토픽 제외 수, 최종 후보 수)뿐이다.
     """
     categories = discovery_target if discovery_target else list(CATEGORY_SEEDS.keys())
     categories = [c for c in categories if c in CATEGORY_SEEDS]
@@ -413,7 +447,6 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
             log("[collector] 유효한 카테고리가 없어 전체 카테고리로 진행합니다.")
         categories = list(CATEGORY_SEEDS.keys())
 
-    # 보조 시드 키워드 병합(선택)
     extra_by_category = {}
     if light_filter_target:
         for cat in categories:
@@ -422,7 +455,7 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
             if matched:
                 extra_by_category[cat] = matched
 
-    tasks = []  # (category, seed_query, anchors)
+    tasks = []
     for cat in categories:
         anchors = CATEGORY_SEEDS[cat]["anchors"]
         seeds = list(CATEGORY_SEEDS[cat]["seeds"]) + extra_by_category.get(cat, [])
@@ -432,7 +465,10 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
     if log:
         log(f"[collector] 수집 대상 카테고리: {', '.join(categories)} (시드 쿼리 {len(tasks)}건)")
 
-    global_agg = {}  # (category, keyword) -> aggregated entry
+    global_agg = {}
+    total_news_fetched = 0
+    total_offtopic_skipped = 0
+    total_empty_skipped = 0
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
         future_map = {
@@ -442,11 +478,15 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
         for future in as_completed(future_map):
             cat, seed = future_map[future]
             try:
-                local_agg = future.result()
+                local_agg, offtopic_skipped, empty_skipped, fetched_count = future.result()
             except Exception as e:
                 if log:
                     log(f"[collector] 시드 처리 실패 (category='{cat}', seed='{seed}'): {e}")
                 continue
+
+            total_news_fetched += fetched_count
+            total_offtopic_skipped += offtopic_skipped
+            total_empty_skipped += empty_skipped
 
             for key, entry in local_agg.items():
                 gkey = (cat, key)
@@ -472,7 +512,6 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
             if log:
                 log(f"[collector] 완료: category='{cat}', seed='{seed}', 신규 후보 {len(local_agg)}건")
 
-    # 카테고리별 상위 max_per_category개로 컷하고 최종 출력 계약 형태로 변환
     by_category = {}
     for (cat, key), entry in global_agg.items():
         by_category.setdefault(cat, []).append(entry)
@@ -494,13 +533,15 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
             })
 
     if log:
+        log(f"[collector] 원본 뉴스 조회 {total_news_fetched}건 - "
+            f"오프토픽(정치/국제/연예/스포츠/학교) 제외 {total_offtopic_skipped}건, "
+            f"본문없음 제외 {total_empty_skipped}건")
         log(f"[collector] 최종 후보 수: {len(result)}건 (카테고리 {len(by_category)}개)")
 
     return result
 
 
 if __name__ == "__main__":
-    # 간단한 단독 실행 테스트(실제 API 키 없이는 동작하지 않음. 구조 확인용).
     class _DummyAPI:
         def search_news(self, query, display=100, start=1, sort="date"):
             return []
