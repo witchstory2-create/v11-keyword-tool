@@ -1,307 +1,614 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v18.2) - Verification + Scoring 단계 전담
+scorer.py (v18.6)
+네이버 블로그 수익형 키워드 발굴 시스템 - 검증/확장/점수화/등급분류 통합 엔진
 
-[이 파일의 역할]
-- collector.py -> profit_filter.py를 거친 후보(keyword, category, mentions, articles,
-  recency, category_weight, has_intent, profit_tags 등)를 입력으로 받는다.
-- naver_search_api.py(NaverSearchAPI/NaverDataLabAPI/NaverAdsAPI)를 호출하여
-  검색량 / 문서수 / DataLab 상승률을 실측 교차검증한다.
-- 4단계 교차검증을 수행한다: 뉴스 언급(이미 통과) -> 검색량 확인 -> 문서수 확인 -> DataLab 확인.
-  API가 '설정되어 있는데' 특정 후보에서 값이 확인되지 않으면 그 후보는 탈락시킨다.
-  API 자체가 '설정되지 않은' 경우는 해당 단계 요구를 생략한다(전체 결과가 0이 되는 것을 방지).
-- 검색량 대비 문서수 효율을 계산한다.
-- FinalScore = IssueScore * OpportunityScore * CategoryWeight 원칙으로 최종 점수를 산출한다.
-- 과포화(문서수 과다) 및 범용 상시성 키워드는 하향 조정한다.
-- 최종적으로 TOP5 / TOP10 / 보류 / 위험 4단계로 분류한다.
+[파이프라인 내 위치]
+  collector.collect_candidates() -> profit_filter.filter_candidates() -> scorer.score_candidates()
 
-[이 파일이 하지 않는 일 - 다른 파일의 책임]
-- 뉴스 수집, 후보 추출 -> collector.py
-- 수익형 카테고리 판단, 가중치 원천 데이터 제공 -> profit_filter.py
-- 실제 API 호출 구현(서명 생성, HTTP 요청 등) -> naver_search_api.py
-- 화면 표시 -> app.py
+[이 파일이 담당하는 5단계]
+  1단계 : 검색량 확인        (ads_api.get_search_volume)  - 검색량 0인 후보는 조기 탈락
+  2단계 : 연관검색어 확장    (ads_api.get_related_keywords) - "검색량이 확인된" 대표 후보에만 한정
+  3단계 : 문서수 확인        (search_api.get_blog_doc_count)
+  4단계 : DataLab 확인       (datalab_api.get_trend_ratio)
+  5단계 : 점수화/등급분류    IssueScore, OpportunityScore, FinalScore, 위험/보류/TOP5/TOP10
 
-[등급 정책]
-- 위험(빨강) : 오직 '범용 상시성 키워드(시드 자체)'일 때만 부여.
-- 보류(회색) : 문서수 과다 또는 DataLab 상승률 미달 등 '오늘 매력적이지 않은' 경우.
-- TOP5 / TOP10 : 위험/보류가 아니면서 신뢰도(confidence) 충족 + 순위가 높은 경우.
+[핵심 설계 원칙 - API 낭비 방지]
+  연관검색어 확장은 "검색량이 이미 확인된" 후보 중 카테고리별 대표 상위 N개에만 적용한다.
+  검색량 미확인 상태에서 연관검색어를 먼저 뽑으면 후보가 기하급수적으로 늘어나
+  문서수/DataLab 조회에 API 호출이 낭비되므로, 반드시 이 순서를 지킨다.
+
+[출력 계약] score_candidates()는 (results, api_health) 튜플을 반환한다.
+
+  results: list[dict], 각 원소는 아래 필드를 포함한다.
+    {
+        "rank"              : int    # 전체 순위 (탈락하지 않은 후보 중)
+        "grade"             : str    # "TOP5" | "TOP10" | "보류" | "위험"
+        "keyword"           : str
+        "category"          : str
+        "final_score"       : float
+        "issue_score"       : float
+        "opportunity_score" : float
+        "category_weight"   : float
+        "search_volume"     : int
+        "doc_count"         : int
+        "efficiency"        : float  # search_volume / max(doc_count, 1)
+        "mentions"          : int    # 뉴스 언급 수 (연관검색어로만 발견된 경우 0)
+        "timing"            : str    # "오늘" | "오후" | "주간" | "상시"
+        "verify_news"       : bool
+        "verify_volume"     : bool
+        "verify_docs"       : bool
+        "verify_datalab"    : bool
+        "risk_reasons"      : list[str]
+        "hold_reasons"      : list[str]
+        "reason_tags"       : list[str]   # 화면 표시용 추천/보류 사유 (예: "검색량↑", "DataLab↑", "CPC높음")
+        "source"            : list[str]   # ["news"], ["ads"], 또는 둘 다
+    }
+
+  api_health: dict
+    {"search": "ok"|"partial"|"fail", "ads": "ok"|"partial"|"fail", "datalab": "ok"|"partial"|"fail"}
+    각 API 호출의 성공/실패 비율을 집계해 분석 종료 후 UI 상단에 상시 표시할 수 있게 한다.
+
+표준 라이브러리만 사용 (math, time, random, threading, datetime, concurrent.futures)
+-> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
 """
 
 import math
-
-SPIKE_HARDCUT = 1.3
-RISK_DOC_GENERIC = 300_000     # 범용 키워드 + 이 이상 문서수 => 위험(경쟁 극심)
-HOLD_DOC_ABS = 1_000_000       # 일반 키워드라도 이 이상 문서수 => 보류(경쟁 심함)
-CPC_DEFAULT = 450
-
-
-def _log(fn, msg):
-    if fn:
-        fn(msg)
+import time
+import random
+import threading
+from datetime import datetime, date
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
-def _norm(value, max_value):
-    """value를 0~1 사이로 정규화한다. max_value가 0 이하이면 0을 반환한다."""
-    if not max_value or max_value <= 0:
-        return 0.0
-    return max(0.0, min(1.0, value / max_value))
+# =========================================================================
+# 0. 하이퍼파라미터
+# =========================================================================
+MIN_SEARCH_VOLUME = 10          # 이보다 검색량이 낮으면 1단계에서 탈락
+MAX_RELATED_PER_CATEGORY = 5    # 카테고리별 연관검색어 확장 대표 후보 수 (API 낭비 방지 핵심)
+RELATED_LIMIT = 30              # 대표 후보 1개당 받아올 연관검색어 최대 개수
+DATALAB_HARD_CUT = 1.3          # 이 비율 이상이어야 "상승"으로 인정
+
+RISK_DOC_ABS = 50000            # 이 문서수를 넘으면서 범용 앵커이면 "위험"
+HOLD_DOC_ABS = 15000            # 이 문서수를 넘으면 "보류"(경쟁 심함)
+LOW_EFFICIENCY_CUT = 0.5        # search_volume/doc_count 이 값보다 낮으면 비효율 보류 사유 추가
+
+TOP5_SIZE = 5
+TOP10_SIZE = 10                 # TOP5 이후 순위 6~15
+MAX_WORKERS = 4
+
+# 범용/상시성 앵커 - "위험"은 오직 이 앵커들에서만 부여 (요청사항: 범용어에만 위험 적용)
+GENERIC_RISK_ANCHORS = {"보험", "대출", "연금", "세금", "카드", "부동산", "청약"}
 
 
-def estimate_monthly_revenue_won(search_volume, doc_count, cpc=CPC_DEFAULT,
-                                  ctr=0.03, ad_click_rate=0.35, rank_share=0.05):
-    """
-    참고용 추정 월수익(원)을 계산한다.
-    - 문서수가 많을수록 포화 페널티(saturation_penalty)가 커져 방문자 추정치가 줄어든다.
-    - 이 값은 정밀한 실측이 아니라 우선순위 판단을 돕기 위한 참고 지표임을 화면에 함께 표기해야 한다.
-    """
-    if not search_volume or search_volume <= 0:
+# =========================================================================
+# 1. API 안전 호출 래퍼 + api_health 집계
+# =========================================================================
+class ApiHealthTracker:
+    """스레드에서 동시에 호출되므로 락으로 카운터를 보호한다."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._counts = {
+            "search": {"ok": 0, "fail": 0},
+            "ads": {"ok": 0, "fail": 0},
+            "datalab": {"ok": 0, "fail": 0},
+        }
+
+    def record(self, api_name, success):
+        with self._lock:
+            key = "ok" if success else "fail"
+            self._counts[api_name][key] += 1
+
+    def summarize(self):
+        summary = {}
+        for api_name, counts in self._counts.items():
+            total = counts["ok"] + counts["fail"]
+            if total == 0:
+                summary[api_name] = "ok"  # 호출 자체가 없었으면 문제 없음으로 간주
+            elif counts["fail"] == 0:
+                summary[api_name] = "ok"
+            elif counts["ok"] == 0:
+                summary[api_name] = "fail"
+            else:
+                summary[api_name] = "partial"
+        return summary
+
+
+def _safe_call(fn, tracker, api_name, log=None, context=""):
+    """API 호출을 감싸서 예외를 흡수하고 성공/실패를 tracker에 기록. 실패 시 None 반환."""
+    try:
+        result = fn()
+        tracker.record(api_name, True)
+        return result
+    except Exception as e:
+        tracker.record(api_name, False)
+        if log:
+            log(f"[scorer] API 호출 실패 ({api_name}, {context}): {e}")
         return None
-    saturation_penalty = 1.0
-    if doc_count and doc_count > 0:
-        saturation_penalty = 1.0 / (1.0 + math.log10(doc_count + 10) / 3.0)
-    visits = search_volume * rank_share * saturation_penalty
-    clicks = visits * ctr * ad_click_rate
-    revenue = clicks * cpc
-    return int(revenue)
 
 
-def _timing_label(recency, spike_ratio):
-    """최근성(recency, 시간 단위) + DataLab 상승률을 조합해 작성 타이밍 등급을 매긴다."""
-    if recency is not None and recency <= 12 and (spike_ratio or 0) >= SPIKE_HARDCUT:
+# =========================================================================
+# 2. 1단계: 검색량 확인
+# =========================================================================
+def _fetch_volume_one(ads_api, keyword, tracker, log):
+    vol = _safe_call(lambda: ads_api.get_search_volume(keyword), tracker, "ads", log, f"volume:{keyword}")
+    time.sleep(0.08 + random.random() * 0.08)
+    return keyword, (vol if isinstance(vol, int) else 0)
+
+
+def _check_search_volume(candidates, ads_api, tracker, log=None, max_workers=MAX_WORKERS):
+    """모든 후보에 대해 검색량을 조회하고, MIN_SEARCH_VOLUME 미만은 탈락시킨다."""
+    unique_keywords = list({c["keyword"] for c in candidates})
+    volume_map = {}
+
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_fetch_volume_one, ads_api, kw, tracker, log): kw for kw in unique_keywords}
+        for future in as_completed(futures):
+            kw, vol = future.result()
+            volume_map[kw] = vol
+
+    survived, dropped = [], []
+    for c in candidates:
+        vol = volume_map.get(c["keyword"], 0)
+        entry = dict(c)
+        entry["search_volume"] = vol
+        entry["verify_volume"] = vol >= MIN_SEARCH_VOLUME
+        if entry["verify_volume"]:
+            survived.append(entry)
+        else:
+            dropped.append(entry)
+
+    if log:
+        log(f"[scorer] 1단계 검색량 확인: 통과 {len(survived)}건 / 탈락 {len(dropped)}건 "
+            f"(기준 {MIN_SEARCH_VOLUME} 미달)")
+
+    return survived, dropped
+
+
+# =========================================================================
+# 3. 2단계: 연관검색어 확장 (검색량 확인된 후보 중 대표만)
+# =========================================================================
+def _select_representatives(survived, per_category=MAX_RELATED_PER_CATEGORY):
+    """카테고리별로 (검색량 x intent_score) 기준 상위 N개만 대표로 선정."""
+    by_category = {}
+    for c in survived:
+        by_category.setdefault(c["category"], []).append(c)
+
+    reps = []
+    for cat, items in by_category.items():
+        items_sorted = sorted(
+            items, key=lambda x: x["search_volume"] * x.get("intent_score", 0.3), reverse=True
+        )
+        reps.extend(items_sorted[:per_category])
+    return reps
+
+
+def _expand_related_one(ads_api, rep, tracker, log):
+    kw = rep["keyword"]
+    related = _safe_call(
+        lambda: ads_api.get_related_keywords(kw, limit=RELATED_LIMIT),
+        tracker, "ads", log, f"related:{kw}"
+    )
+    time.sleep(0.1 + random.random() * 0.1)
+    return rep, (related or [])
+
+
+def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=MAX_WORKERS):
+    """
+    검색량이 확인된 대표 후보에 한정해 연관검색어를 확장한다.
+    연관검색어는 API 호출 한 번으로 검색량 데이터까지 함께 오므로, 반환값을 그대로 신뢰하고
+    별도의 검색량 재조회를 하지 않는다 (API 절약의 핵심).
+    """
+    if not hasattr(ads_api, "get_related_keywords"):
+        if log:
+            log("[scorer] ads_api.get_related_keywords 미제공 - 2단계 확장을 건너뜁니다.")
+        return []
+
+    reps = _select_representatives(survived)
+    if log:
+        log(f"[scorer] 2단계 연관검색어 확장 대상: {len(reps)}건 (카테고리별 상위 {MAX_RELATED_PER_CATEGORY}개)")
+
+    expanded = []
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(_expand_related_one, ads_api, rep, tracker, log): rep for rep in reps}
+        for future in as_completed(futures):
+            rep, related_items = future.result()
+            for item in related_items:
+                rel_kw = (item.get("keyword") or item.get("relKeyword") or "").strip()
+                rel_vol = item.get("total_volume")
+                if rel_vol is None:
+                    pc = item.get("monthlyPcQcCnt", 0) or 0
+                    mo = item.get("monthlyMobileQcCnt", 0) or 0
+                    rel_vol = pc + mo
+                if not rel_kw or rel_vol < MIN_SEARCH_VOLUME:
+                    continue
+                if rep["anchor"] not in rel_kw and rep["keyword"] not in rel_kw:
+                    continue  # 원 앵커와 무관한 광범위 결과 배제
+
+                expanded.append({
+                    "keyword": rel_kw,
+                    "category": rep["category"],
+                    "anchor": rep["anchor"],
+                    "intent_word": rep.get("intent_word"),
+                    "mentions": 0,
+                    "sample_titles": [],
+                    "seed_query": rep["keyword"],
+                    "first_pub_date": "",
+                    "latest_pub_date": "",
+                    "intent_score": rep.get("intent_score", 0.3),
+                    "category_weight": rep.get("category_weight", 1.0),
+                    "category_meta": rep.get("category_meta", {}),
+                    "source": ["ads"],
+                    "search_volume": int(rel_vol),
+                    "verify_volume": True,
+                })
+
+    # 중복 제거 (동일 키워드가 여러 대표에서 발견될 수 있음)
+    dedup = {}
+    for e in expanded:
+        key = (e["category"], e["keyword"])
+        if key not in dedup:
+            dedup[key] = e
+    result = list(dedup.values())
+
+    if log:
+        log(f"[scorer] 2단계 연관검색어 신규 후보: {len(result)}건")
+    return result
+
+
+def _merge_pools(survived, expanded):
+    """뉴스 기반(검색량 확인됨) + 연관검색어 기반 후보를 병합, source 필드 통합."""
+    merged = {}
+    for c in survived:
+        key = (c["category"], c["keyword"])
+        entry = dict(c)
+        entry.setdefault("source", ["news"])
+        merged[key] = entry
+    for c in expanded:
+        key = (c["category"], c["keyword"])
+        if key in merged:
+            existing_sources = set(merged[key].get("source", []))
+            existing_sources.update(c.get("source", ["ads"]))
+            merged[key]["source"] = sorted(existing_sources)
+        else:
+            merged[key] = c
+    return list(merged.values())
+
+
+# =========================================================================
+# 4. 3단계: 문서수 확인
+# =========================================================================
+def _fetch_doc_count_one(search_api, keyword, tracker, log):
+    count = _safe_call(
+        lambda: search_api.get_blog_doc_count(keyword), tracker, "search", log, f"doc:{keyword}"
+    )
+    time.sleep(0.08 + random.random() * 0.08)
+    return keyword, count  # None이면 API 실패, 0이면 정상 응답(문서 없음)
+
+
+def _check_doc_counts(candidates, search_api, tracker, log=None, max_workers=MAX_WORKERS):
+    unique_keywords = list({c["keyword"] for c in candidates})
+    doc_map = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_doc_count_one, search_api, kw, tracker, log): kw
+            for kw in unique_keywords
+        }
+        for future in as_completed(futures):
+            kw, count = future.result()
+            doc_map[kw] = count
+
+    survived, dropped = [], []
+    for c in candidates:
+        count = doc_map.get(c["keyword"])
+        entry = dict(c)
+        if count is None:
+            # API 자체가 실패한 경우만 탈락 (문서수 0은 유효한 "경쟁 없음" 신호이므로 살린다)
+            entry["doc_count"] = None
+            entry["verify_docs"] = False
+            dropped.append(entry)
+        else:
+            entry["doc_count"] = count
+            entry["verify_docs"] = True
+            survived.append(entry)
+
+    if log:
+        log(f"[scorer] 3단계 문서수 확인: 통과 {len(survived)}건 / API 실패 탈락 {len(dropped)}건")
+
+    return survived, dropped
+
+
+# =========================================================================
+# 5. 4단계: DataLab 확인
+# =========================================================================
+def _fetch_trend_one(datalab_api, keyword, tracker, log):
+    ratio = _safe_call(
+        lambda: datalab_api.get_trend_ratio(keyword), tracker, "datalab", log, f"trend:{keyword}"
+    )
+    time.sleep(0.08 + random.random() * 0.08)
+    return keyword, ratio  # None이면 실패 또는 데이터 없음
+
+
+def _check_datalab(candidates, datalab_api, tracker, log=None, max_workers=MAX_WORKERS):
+    unique_keywords = list({c["keyword"] for c in candidates})
+    trend_map = {}
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = {
+            executor.submit(_fetch_trend_one, datalab_api, kw, tracker, log): kw
+            for kw in unique_keywords
+        }
+        for future in as_completed(futures):
+            kw, ratio = future.result()
+            trend_map[kw] = ratio
+
+    for c in candidates:
+        ratio = trend_map.get(c["keyword"])
+        c["datalab_ratio"] = ratio
+        c["verify_datalab"] = ratio is not None and ratio >= DATALAB_HARD_CUT
+
+    if log:
+        confirmed = sum(1 for c in candidates if c["verify_datalab"])
+        log(f"[scorer] 4단계 DataLab 확인: 상승 확인 {confirmed}건 / 전체 {len(candidates)}건")
+
+    return candidates
+
+
+# =========================================================================
+# 6. 신선도 계산 (여기서 계산 - 요청사항 반영)
+# =========================================================================
+def _compute_freshness(latest_pub_date, source):
+    if "news" not in source or not latest_pub_date:
+        return 0.5  # 연관검색어 단독 발견 후보는 중립값
+    try:
+        pub = datetime.strptime(latest_pub_date, "%Y-%m-%d").date()
+    except Exception:
+        return 0.1
+    diff = (date.today() - pub).days
+    if diff <= 1:
+        return 1.0
+    if diff <= 3:
+        return 0.7
+    if diff <= 7:
+        return 0.4
+    return 0.1
+
+
+def _classify_timing(freshness, datalab_ratio):
+    if freshness >= 1.0 and (datalab_ratio or 0) >= DATALAB_HARD_CUT:
         return "오늘"
-    if recency is not None and recency <= 24:
+    if freshness >= 1.0:
         return "오후"
-    if recency is not None and recency <= 168:
+    if freshness >= 0.4:
         return "주간"
     return "상시"
 
 
-def verify_candidate(cand, search_api, datalab_api, ads_api, log=None):
-    """
-    collector.py -> profit_filter.py가 넘긴 후보에
-    naver_search_api.py 실측값(doc_count/search_volume/spike_ratio)을 덧붙인다.
-    원본 필드(keyword/category/mentions/articles/recency/category_weight/has_intent/
-    profit_tags/matched_seed/generic_flag)는 dict(cand)로 그대로 보존된다.
-    """
-    keyword = cand["keyword"]
-    result = dict(cand)
-    result.update({
-        "doc_count": None, "doc_status": "검증 실패", "doc_error": None,
-        "search_volume": None, "search_status": "검증 실패", "search_error": None,
-        "comp_idx": None,
-        "spike_ratio": None, "datalab_status": "검증 실패", "datalab_error": None,
-    })
+# =========================================================================
+# 7. 점수 계산
+# =========================================================================
+def _compute_issue_score(mentions, freshness, datalab_ratio):
+    mention_component = min(mentions, 20) / 20.0          # 0~1
+    freshness_component = freshness                        # 0~1
+    ratio = datalab_ratio if datalab_ratio else 0.5
+    datalab_component = min(ratio / 2.0, 1.0)               # 0~1 (비율 2.0 이상이면 만점)
+    score = (mention_component * 0.3 + freshness_component * 0.3 + datalab_component * 0.4) * 10
+    return round(score, 2)
 
-    if search_api and search_api.client_id and search_api.client_secret:
-        blog_total, err1 = search_api.get_blog_doc_count(keyword)
-        news_total, err2 = search_api.get_news_doc_count(keyword)
-        if blog_total is not None:
-            result["doc_count"] = blog_total + (news_total or 0)
-            result["doc_status"] = "검증 완료"
+
+def _compute_opportunity_score(search_volume, doc_count):
+    doc_count = doc_count if doc_count is not None else 0
+    volume_component = math.log10(search_volume + 1)
+    competition_component = math.log10(doc_count + 10)
+    score = (volume_component / competition_component) * 3.0
+    return round(min(score, 10.0), 2)
+
+
+def _compute_efficiency(search_volume, doc_count):
+    doc_count = doc_count if doc_count is not None else 0
+    return round(search_volume / max(doc_count, 1), 2)
+
+
+# =========================================================================
+# 8. 등급 분류 (위험 / 보류 / TOP5 / TOP10)
+# =========================================================================
+def _build_risk_reasons(entry):
+    reasons = []
+    anchor = entry.get("anchor", "")
+    doc_count = entry.get("doc_count") or 0
+    has_intent = bool(entry.get("intent_word"))
+
+    # "위험"은 오직 범용/상시성 앵커 + 구체적 검색의도 없음 + 문서수 과다에만 적용
+    if anchor in GENERIC_RISK_ANCHORS and not has_intent and doc_count > RISK_DOC_ABS:
+        reasons.append(f"범용 상시 키워드('{anchor}') + 문서수 {doc_count:,}건으로 경쟁 과다")
+    return reasons
+
+
+def _build_hold_reasons(entry):
+    reasons = []
+    doc_count = entry.get("doc_count") or 0
+    search_volume = entry.get("search_volume", 0)
+    efficiency = entry.get("efficiency", 0)
+
+    if RISK_DOC_ABS >= doc_count > HOLD_DOC_ABS:
+        reasons.append(f"문서수 과다({doc_count:,}건) - 경쟁 심함")
+    if not entry.get("verify_datalab"):
+        if entry.get("datalab_ratio") is None:
+            reasons.append("DataLab 데이터 없음")
         else:
-            result["doc_error"] = err1 or err2
-            _log(log, f"[scorer] 문서수 검증 실패({keyword}): {result['doc_error']}")
-    else:
-        result["doc_error"] = "검색 API 키 미설정"
-
-    if ads_api and ads_api.customer_id and ads_api.license_key and ads_api.secret_key:
-        stats, err = ads_api.get_keyword_stats(keyword)
-        if stats is not None:
-            result["search_volume"] = stats["total"]
-            result["comp_idx"] = stats["comp_idx"]
-            result["search_status"] = "검증 완료"
-        else:
-            result["search_error"] = err
-            _log(log, f"[scorer] 검색량 검증 실패({keyword}): {err}")
-    else:
-        result["search_error"] = "검색광고 API 키 미설정"
-
-    if datalab_api and datalab_api.client_id and datalab_api.client_secret:
-        ok, spike, err = datalab_api.get_spike_ratio(keyword)
-        if ok:
-            result["spike_ratio"] = spike
-            result["datalab_status"] = "검증 완료"
-        else:
-            result["datalab_error"] = err
-            _log(log, f"[scorer] DataLab 검증 실패({keyword}): {err}")
-    else:
-        result["datalab_error"] = "DataLab API 키 미설정"
-
-    return result
+            reasons.append(f"DataLab 상승 미확인(비율 {entry['datalab_ratio']:.2f})")
+    if efficiency < LOW_EFFICIENCY_CUT and doc_count > 0:
+        reasons.append(f"검색량 대비 문서수 비효율(효율 {efficiency:.2f})")
+    return reasons
 
 
-def _recommend_tags(r):
-    """화면에 표시할 '추천 이유' 태그 목록을 만든다."""
+def _build_reason_tags(entry):
     tags = []
-    if r.get("category"):
-        tags.append(f"카테고리: {r['category']} (가중치 x{r.get('category_weight', 1.0):.1f})")
-    if r.get("mentions"):
-        tags.append(f"뉴스 언급 {r['mentions']}건")
-    if r.get("recency") is not None:
-        tags.append(f"최근 언급 {r['recency']}시간 전")
-    if r.get("spike_ratio") is not None:
-        tags.append(f"DataLab 상승률 x{r['spike_ratio']:.2f}")
-    if r.get("search_volume") is not None:
-        tags.append(f"검색량 {r['search_volume']:,}")
-    if r.get("doc_count") is not None:
-        tags.append(f"문서수 {r['doc_count']:,}")
-    if r.get("efficiency") is not None:
-        tags.append(f"효율(검색량/문서수) {r['efficiency']:.2f}")
-    tags.extend(r.get("profit_tags", []))
+    if entry.get("search_volume", 0) >= 3000:
+        tags.append("검색량↑")
+    if entry.get("verify_datalab"):
+        tags.append("DataLab↑")
+    doc_count = entry.get("doc_count") or 0
+    if 0 <= doc_count <= 1500:
+        tags.append("경쟁낮음")
+    meta = entry.get("category_meta", {})
+    if meta.get("cpc") == "high":
+        tags.append("CPC높음")
+    if "news" in entry.get("source", []) and "ads" in entry.get("source", []):
+        tags.append("뉴스+검색 교차확인")
+    if entry.get("mentions", 0) >= 5:
+        tags.append("다수 매체 언급")
     return tags
 
 
-def _risk_reasons(r):
-    """'쓰면 안 되는' 진짜 위험 요인만 판정. 오직 범용 상시성 키워드(시드 자체)일 때만 부여."""
-    reasons = []
-    if r.get("generic_flag"):
-        doc = r.get("doc_count")
-        if doc is not None and doc > RISK_DOC_GENERIC:
-            reasons.append(f"범용(상시성) 키워드 + 문서수 과다({doc:,}건) - 경쟁 극심")
-        else:
-            reasons.append("범용(상시성) 키워드 - 항상 검색되지만 경쟁도 항상 치열함")
-    return reasons
+def _classify_grade(entry):
+    risk_reasons = _build_risk_reasons(entry)
+    if risk_reasons:
+        return "위험", risk_reasons, []
+
+    hold_reasons = _build_hold_reasons(entry)
+    if hold_reasons:
+        return "보류", [], hold_reasons
+
+    return None, [], []  # 등급 미확정 -> final_score로 순위 매긴 뒤 TOP5/TOP10/보류(순위밖) 결정
 
 
-def _hold_reasons(r):
-    """위험은 아니지만 '오늘 당장 쓸 만큼 매력적이지 않은' 이유. TOP5/10에서 우선순위가 밀리는 요인."""
-    reasons = []
-    doc = r.get("doc_count")
-    if doc is not None and doc > HOLD_DOC_ABS:
-        reasons.append(f"문서수 절대치 과다({doc:,}건) - 경쟁 심함")
-    if r.get("spike_ratio") is not None and r["spike_ratio"] < SPIKE_HARDCUT:
-        reasons.append(f"DataLab 상승률 미달(x{r['spike_ratio']:.2f} < x{SPIKE_HARDCUT})")
-    return reasons
-
-
-def score_candidates(candidates, search_api=None, datalab_api=None, ads_api=None,
-                      verify_top_n=40, log=None):
+# =========================================================================
+# 9. 메인 인터페이스
+# =========================================================================
+def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     """
-    Verification + Scoring 전담 함수.
+    Parameters
+    ----------
+    candidates : list[dict]
+        profit_filter.filter_candidates()의 출력.
+    apis : dict
+        {"search": NaverSearchAPI, "ads": NaverAdsAPI, "datalab": NaverDataLabAPI}
+    log : callable | None
 
-    처리 순서:
-    1) 어느 API가 실제로 설정되어 있는지 확인한다(전체 미설정 시 경고 로그만 남기고 계속 진행).
-    2) verify_top_n개까지의 후보에 대해 verify_candidate()로 실측값을 채운다.
-    3) 4단계 교차검증: '설정된' API에서 값이 확인되지 않은 후보는 탈락시킨다.
-    4) IssueScore(뉴스언급+DataLab상승률+검색량+최근성)와
-       OpportunityScore(검색량*상승률/문서수 로그, 0~1 정규화)를 계산한다.
-    5) FinalScore = IssueScore * OpportunityScore * CategoryWeight 원칙에
-       범용어 페널티, 보류 페널티, API 신뢰도(confidence)를 추가로 곱한다.
-    6) 순위와 위험/보류 사유를 기준으로 TOP5/TOP10/보류/위험 등급을 매긴다.
+    Returns
+    -------
+    (results, api_health) : tuple[list[dict], dict]
     """
-    search_enabled = bool(search_api and search_api.client_id and search_api.client_secret)
-    ads_enabled = bool(ads_api and ads_api.customer_id and ads_api.license_key and ads_api.secret_key)
-    datalab_enabled = bool(datalab_api and datalab_api.client_id and datalab_api.client_secret)
+    tracker = ApiHealthTracker()
+    search_api = apis.get("search")
+    ads_api = apis.get("ads")
+    datalab_api = apis.get("datalab")
 
-    if not (search_enabled or ads_enabled or datalab_enabled):
-        _log(log, "[scorer] 경고: 검색/검색광고/DataLab API가 모두 설정되지 않았습니다. "
-                  "뉴스 언급만으로 결과를 생성하며 정확도가 크게 떨어집니다.")
+    if log:
+        log(f"[scorer] 입력 후보 {len(candidates)}건, 5단계 검증 파이프라인 시작")
 
-    _log(log, f"[scorer] 검증 대상 {min(len(candidates), verify_top_n)}개 "
-              f"(검색API={'ON' if search_enabled else 'OFF'}, "
-              f"검색광고API={'ON' if ads_enabled else 'OFF'}, "
-              f"DataLabAPI={'ON' if datalab_enabled else 'OFF'})")
+    # ---- 1단계: 검색량 확인 ----
+    survived_v, dropped_v = _check_search_volume(candidates, ads_api, tracker, log, max_workers)
 
-    verified = []
-    drop_stats = {"doc": 0, "search_volume": 0, "datalab": 0}
+    # ---- 2단계: 연관검색어 확장 (검색량 확인된 대표 후보에만) ----
+    expanded = _expand_related_keywords(survived_v, ads_api, tracker, log, max_workers)
+    pool = _merge_pools(survived_v, expanded)
 
-    for cand in candidates[:verify_top_n]:
-        v = verify_candidate(cand, search_api, datalab_api, ads_api, log=log)
+    # ---- 3단계: 문서수 확인 ----
+    survived_d, dropped_d = _check_doc_counts(pool, search_api, tracker, log, max_workers)
 
-        # ---- 4단계 교차검증: 뉴스 언급(이미 통과, mentions>=1) -> 검색량 -> 문서수 -> DataLab ----
-        if search_enabled and v["doc_count"] is None:
-            drop_stats["doc"] += 1
-            continue
-        if ads_enabled and (v["search_volume"] is None or v["search_volume"] <= 0):
-            drop_stats["search_volume"] += 1
-            continue
-        if datalab_enabled and v["spike_ratio"] is None:
-            drop_stats["datalab"] += 1
-            continue
+    # ---- 4단계: DataLab 확인 ----
+    survived_d = _check_datalab(survived_d, datalab_api, tracker, log, max_workers)
 
-        verified.append(v)
+    # ---- 5단계: 신선도 + 점수 계산 ----
+    scored = []
+    for entry in survived_d:
+        freshness = _compute_freshness(entry.get("latest_pub_date"), entry.get("source", []))
+        entry["freshness_score"] = round(freshness, 2)
+        entry["timing"] = _classify_timing(freshness, entry.get("datalab_ratio"))
 
-    _log(log, f"[scorer] 4단계 교차검증 통과: {len(verified)}개 "
-              f"(문서수 탈락 {drop_stats['doc']}, 검색량 탈락 {drop_stats['search_volume']}, "
-              f"DataLab 탈락 {drop_stats['datalab']})")
-
-    if not verified:
-        return []
-
-    max_mentions = max([v.get("mentions", 0) for v in verified] or [1])
-    max_search = max([v.get("search_volume") or 0 for v in verified] or [1])
-    max_opp_raw = 0.0
-
-    # 1차 패스: IssueScore, OpportunityScore(raw), 효율 계산
-    for v in verified:
-        doc = v.get("doc_count")
-        sv = v.get("search_volume")
-        spike = v.get("spike_ratio")
-
-        v["efficiency"] = (sv / math.log(doc + 10)) if (sv is not None and doc is not None) else None
-
-        recency_score = 1.0
-        if v.get("recency") is not None:
-            recency_score = max(0.0, 1.0 - min(v["recency"], 168) / 168.0)
-
-        issue_score = (
-            0.3 * _norm(v.get("mentions", 0), max_mentions)
-            + 0.3 * _norm((spike or 0), 3.0)
-            + 0.2 * _norm((sv or 0), max_search)
-            + 0.2 * recency_score
+        entry["issue_score"] = _compute_issue_score(
+            entry.get("mentions", 0), freshness, entry.get("datalab_ratio")
         )
-        v["issue_score"] = round(issue_score, 4)
+        entry["opportunity_score"] = _compute_opportunity_score(
+            entry["search_volume"], entry.get("doc_count")
+        )
+        entry["efficiency"] = _compute_efficiency(entry["search_volume"], entry.get("doc_count"))
+        entry["final_score"] = round(
+            entry["issue_score"] * entry["opportunity_score"] * entry.get("category_weight", 1.0), 2
+        )
+        entry["verify_news"] = entry.get("mentions", 0) > 0 or "news" in entry.get("source", [])
+        scored.append(entry)
 
-        if sv is not None and doc is not None:
-            opp_raw = (sv * max(spike or 1.0, 1.0)) / math.log(doc + 10)
+    # ---- 등급 분류 1차 (위험/보류 확정) ----
+    remaining = []
+    finalized = []
+    for entry in scored:
+        grade, risk_reasons, hold_reasons = _classify_grade(entry)
+        entry["risk_reasons"] = risk_reasons
+        entry["hold_reasons"] = hold_reasons
+        if grade == "위험":
+            entry["grade"] = "위험"
+            finalized.append(entry)
+        elif grade == "보류":
+            entry["grade"] = "보류"
+            finalized.append(entry)
         else:
-            opp_raw = 0.0
-        v["_opp_raw"] = opp_raw
-        max_opp_raw = max(max_opp_raw, opp_raw)
+            remaining.append(entry)
 
-    # 2차 패스: OpportunityScore 정규화 + CategoryWeight 반영한 FinalScore
-    for v in verified:
-        opp_norm = _norm(v["_opp_raw"], max_opp_raw)
-        v["opportunity_score"] = round(opp_norm, 4)
-
-        category_weight = v.get("category_weight", 1.0)
-
-        v["risk_reasons"] = _risk_reasons(v)
-        v["hold_reasons"] = _hold_reasons(v)
-        v["recommend_tags"] = _recommend_tags(v)
-        v["timing"] = _timing_label(v.get("recency"), v.get("spike_ratio"))
-        sv, doc = v.get("search_volume"), v.get("doc_count")
-        v["estimated_revenue_won"] = estimate_monthly_revenue_won(sv, doc) if (sv and doc is not None) else None
-
-        generic_penalty = 0.4 if v["risk_reasons"] else 1.0
-        hold_penalty = 0.75 if v["hold_reasons"] else 1.0
-
-        verified_cnt = sum([
-            1 if v["doc_status"] == "검증 완료" else 0,
-            1 if v["search_status"] == "검증 완료" else 0,
-            1 if v["datalab_status"] == "검증 완료" else 0,
-        ])
-        confidence = verified_cnt / 3.0
-        v["confidence"] = confidence
-
-        # FinalScore = IssueScore * OpportunityScore * CategoryWeight (핵심 원칙)
-        base = v["issue_score"] * (0.3 + 0.7 * v["opportunity_score"]) * 100
-        final_score = base * category_weight * generic_penalty * hold_penalty * (0.4 + 0.6 * confidence)
-        v["final_score"] = round(final_score, 2)
-        del v["_opp_raw"]
-
-    verified.sort(key=lambda x: x["final_score"], reverse=True)
-
-    for i, v in enumerate(verified):
-        if v["risk_reasons"]:
-            v["grade"] = "위험"
-        elif v["hold_reasons"] and v["confidence"] < 0.67:
-            v["grade"] = "보류"
-        elif i < 5 and v["confidence"] >= 0.34:
-            v["grade"] = "TOP5"
-        elif i < 10 and v["confidence"] >= 0.34:
-            v["grade"] = "TOP10"
+    # ---- 등급 분류 2차 (순위 기반 TOP5/TOP10/순위밖 보류) ----
+    remaining.sort(key=lambda e: -e["final_score"])
+    for idx, entry in enumerate(remaining, start=1):
+        if idx <= TOP5_SIZE:
+            entry["grade"] = "TOP5"
+        elif idx <= TOP5_SIZE + TOP10_SIZE:
+            entry["grade"] = "TOP10"
         else:
-            v["grade"] = "보류"
+            entry["grade"] = "보류"
+            entry["hold_reasons"] = entry.get("hold_reasons", []) + ["TOP15 순위 밖"]
+        finalized.append(entry)
 
-    return verified
+    # ---- reason_tags 및 전체 순위 부여 ----
+    finalized.sort(key=lambda e: -e["final_score"])
+    for rank, entry in enumerate(finalized, start=1):
+        entry["rank"] = rank
+        entry["reason_tags"] = _build_reason_tags(entry)
+        # 다운스트림(app.py)에서 불필요한 내부 필드 정리
+        entry.pop("sample_titles", None)
+
+    api_health = tracker.summarize()
+
+    if log:
+        grade_counts = {}
+        for e in finalized:
+            grade_counts[e["grade"]] = grade_counts.get(e["grade"], 0) + 1
+        log(f"[scorer] 최종 결과 {len(finalized)}건 - "
+            f"TOP5 {grade_counts.get('TOP5', 0)}, TOP10 {grade_counts.get('TOP10', 0)}, "
+            f"보류 {grade_counts.get('보류', 0)}, 위험 {grade_counts.get('위험', 0)}")
+        log(f"[scorer] API 상태: 검색={api_health['search']}, "
+            f"검색광고={api_health['ads']}, DataLab={api_health['datalab']}")
+        log(f"[scorer] 탈락 현황: 검색량 미달 {len(dropped_v)}건, 문서수 API 실패 {len(dropped_d)}건")
+
+    return finalized, api_health
+
+
+if __name__ == "__main__":
+    def _print_log(msg):
+        print(msg)
+
+    class _DummyAds:
+        def get_search_volume(self, keyword):
+            return 5000
+        def get_related_keywords(self, keyword, limit=30):
+            return [{"keyword": f"{keyword} 신청", "total_volume": 3000}]
+
+    class _DummySearch:
+        def get_blog_doc_count(self, keyword):
+            return 1200
+
+    class _DummyDataLab:
+        def get_trend_ratio(self, keyword):
+            return 1.6
+
+    dummy_candidates = [
+        {"keyword": "민생지원금", "category": "지원금", "anchor": "지원금",
+         "intent_word": None, "mentions": 12, "sample_titles": [],
+         "seed_query": "민생지원금", "first_pub_date": "2026-06-28", "latest_pub_date": "2026-06-30",
+         "intent_score": 0.5, "category_weight": 1.5, "category_meta": {"cpc": "high"}, "source": ["news"]},
+    ]
+    apis = {"search": _DummySearch(), "ads": _DummyAds(), "datalab": _DummyDataLab()}
+    results, health = score_candidates(dummy_candidates, apis, log=_print_log)
+    for r in results:
+        print(r)
+    print("api_health:", health)
