@@ -1,194 +1,296 @@
-# collector.py
-# v16.4 - 이슈 키워드 후보 수집기
-# 변경 사항(2026-07):
-#   1) 구글 뉴스 RSS 제목 끝에 붙는 " - 언론사명" 부분을 제거
-#      (기존에는 이게 그대로 남아 "머니투데이", "조선일보" 등이 키워드처럼 카운트됨)
-#   2) 한 단어(unigram) 후보는 GENERIC_SEED_WORDS 이거나 수익 카테고리 단어를
-#      직접 포함하는 경우에만 인정. 그 외("고유가" 등 개념 파편)는 후보에서 제외
-#   3) [NEW] BLOCKED_WORDS에 '대한', '위한', '관한', '따른', '대해' 등 문법적 연결어를
-#      대폭 보강. 이런 단어들은 "~에 대한", "~을 위한"처럼 명사 앞에서 문장을 이어줄 뿐
-#      독립적인 의미가 없는데, 지금까지는 걸러지지 않아서 바로 옆 단어와 묶여
-#      "대한 대출"처럼 실제로 존재하지 않는 조합(붙이면 '대환대출'과 혼동됨)을 만들어냈음.
+# -*- coding: utf-8 -*-
+"""
+collector.py (v17 - 수익형 키워드 발굴기)
+Discovery + 경량 필터 단계.
+
+1) Google News RSS + 네이버 뉴스 검색 API에서 기사를 모은다.
+2) 기사 단위로만 bigram/unigram 후보를 생성한다(서로 다른 기사 결합 금지).
+3) GENERIC_ROOT_BLOCK 단어가 '단독 전체 키워드'인 경우 후보에서 원천 제외한다.
+4) 후보 풀 최대 100개 -> 경량 필터(비-API) -> 상위 40개로 축소해서 반환한다.
+"""
 
 import re
-import feedparser
-from collections import Counter
+import time
+import urllib.request
+import urllib.parse
+import xml.etree.ElementTree as ET
+from datetime import datetime, timezone
+from email.utils import parsedate_to_datetime
 
-RSS_FEEDS = [
-    "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko",
-    "https://news.google.com/rss/search?q=지원금&hl=ko&gl=KR&ceid=KR:ko",
-    "https://news.google.com/rss/search?q=환급&hl=ko&gl=KR&ceid=KR:ko",
-    "https://news.google.com/rss/search?q=대출&hl=ko&gl=KR&ceid=KR:ko",
-    "https://news.google.com/rss/search?q=보험&hl=ko&gl=KR&ceid=KR:ko",
-    "https://news.google.com/rss/search?q=연금&hl=ko&gl=KR&ceid=KR:ko",
-]
+USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KeywordTool/17.0"
 
-# 언론사명 접미사 패턴: "...제목... - 언론사명" 형태에서 뒤쪽 언론사 부분을 통째로 제거
-PRESS_SUFFIX_PATTERN = re.compile(r"\s*-\s*[^-]{1,20}$")
-
-CLEAN_PATTERN = re.compile(r"[\[\(【].*?[\]\)】]|[\"“”'‘’]|…|·")
-
-DATE_TOKEN_PATTERN = re.compile(
-    r"^\d{1,4}(년|월|일|시|분)$|^\d{1,2}(월|일)\d{0,2}(일)?$|^(오늘|내일|어제|이번주|다음주)$"
-)
-
-STOPWORD_TAIL = {
-    "출시", "이벤트", "마감", "매출", "전망", "시작", "종료",
-    "연장", "개최", "안내", "발표", "확대", "축소", "논란",
-    "인상", "인하", "우려", "주의", "경고",
+NEWS_QUERIES = {
+    "보험":     "자동차보험 OR 실손보험 OR 화재보험 OR 보험료",
+    "대출금융": "신용대출 OR 대출금리 OR 정책자금대출 OR 대환대출",
+    "세금":     "종합소득세 OR 연말정산 OR 세금환급 OR 부가세",
+    "연금":     "국민연금 OR 퇴직연금 OR IRP OR 연금저축",
+    "부동산":   "전세대출 OR 청약 OR 임대주택 OR 부동산세",
+    "지원금":   "정부지원금 OR 지원금 신청 OR 온누리상품권 OR 바우처",
 }
 
-GENERIC_SEED_WORDS = {
-    "환급", "대출", "보험", "지원금", "연금", "국민연금", "적금",
-    "예금", "세금", "카드", "수당", "급여", "복지", "혜택",
-}
+GOOGLE_NEWS_RSS = "https://news.google.com/rss/search?q={query}&hl=ko&gl=KR&ceid=KR:ko"
 
-# [CHANGED] 문법적 연결어(조사성 표현)를 대폭 보강.
-# 이 단어들은 뉴스 제목에서 "OOO에 대한", "OOO을 위한", "OOO에 따른"처럼
-# 명사 뒤/앞에 붙어 문장을 이어줄 뿐, 그 자체로는 독립적인 키워드 의미가 없음.
-# 걸러지지 않으면 바로 옆 단어와 묶여 "대한 대출"처럼 실존하지 않는 조합을 만들어냄.
+RAW_POOL_CAP = 100
+PREFILTER_KEEP_N = 40
+
+# 문법적 연결어 / 잡단어 (bigram의 구성 요소로도 금지)
 BLOCKED_WORDS = {
-    "그리고", "하지만", "이번", "정부", "관련", "위해", "통해",
-    "가장", "모든", "많은", "전국", "오늘", "내일",
-    # 여기부터 신규 추가
-    "대한", "위한", "관한", "따른", "대해", "관해", "인한", "의한",
-    "따라", "위해서", "관련해", "대해서", "관해서", "따라서",
-    "이런", "그런", "저런", "이러한", "그러한", "저러한",
-    "같은", "같이", "이후", "이전", "동안", "만큼", "처럼",
+    "대한", "위한", "관한", "따른", "대해", "관련", "이번", "지난", "오늘",
+    "내년", "올해", "최근", "당초", "예정", "이후", "이전", "그동안",
+    "및", "등", "또", "혹은", "그리고", "하지만", "그러나", "한편",
+    "발표", "밝혔다", "전했다", "말했다", "강조", "설명했다", "한국",
 }
 
-MONEY_KEYWORDS = [
-    "지원금", "환급", "대출", "보험", "연금", "수당", "복지",
-    "세금", "카드", "혜택", "적금", "예금", "급여", "상품권",
+# 단독(전체 키워드)으로는 절대 허용하지 않는 범용 명사 사전.
+# 단, 이 단어가 구체적 수식어와 결합된 2어 조합(예: '건강보험료 환급')은
+# collector 단계에서는 통과시키고, scorer 단계에서 문서수 기반으로 위험 판정한다.
+GENERIC_ROOT_BLOCK = {
+    "보험", "대출", "연금", "환급", "지원", "지원금", "정부", "세금", "카드",
+}
+
+PARTICLE_SUFFIXES = [
+    "으로부터", "에게서", "이라도", "에서는", "까지는",
+    "으로는", "에는", "에서", "부터", "까지", "보다", "이나",
+    "이란", "이며", "이고", "이지만",
+    "으로", "로써", "로서",
+    "은", "는", "이", "가", "을", "를", "의", "에", "로", "도", "만",
 ]
 
-MIN_MENTION_COUNT = 2
+PROFIT_KEYWORDS = [
+    "대출", "보험", "연금", "환급", "지원금", "수당", "보조금", "감면",
+    "할인", "카드", "적금", "예금", "청약", "전세", "월세", "분양",
+    "세금", "소득세", "부가세", "연말정산", "IRP", "ISA", "상품권",
+    "바우처", "리모델링", "중도상환", "대환", "보장", "실비",
+]
 
 
-def _strip_press_suffix(title: str) -> str:
-    """구글 뉴스 제목 끝의 ' - 언론사명' 부분을 제거"""
-    return PRESS_SUFFIX_PATTERN.sub("", title).strip()
+def strip_particle(word: str) -> str:
+    for suf in PARTICLE_SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 2:
+            return word[: -len(suf)]
+    return word
 
 
-def _clean_title(title: str) -> str:
-    title = _strip_press_suffix(title)
-    title = CLEAN_PATTERN.sub(" ", title)
+def clean_title(raw_title: str) -> str:
+    title = raw_title.strip()
+    title = re.sub(r"\s*[-|–]\s*[^-|–]{1,20}$", "", title)
+    title = re.sub(r"[\"'“”‘’\[\]()<>]", " ", title)
     title = re.sub(r"\s+", " ", title).strip()
     return title
 
 
-def _clean_token(token: str) -> str:
-    return token.strip(",.!?;:·…\"'()[]{}<>")
+def strip_html(text: str) -> str:
+    import html as html_lib
+    text = re.sub(r"<[^>]+>", "", text or "")
+    return html_lib.unescape(text).strip()
 
 
-def _is_valid_token(token: str) -> bool:
-    if len(token) < 2:
-        return False
-    if DATE_TOKEN_PATTERN.match(token):
-        return False
-    if token in BLOCKED_WORDS:
-        return False
-    if token in STOPWORD_TAIL:
-        return False
-    if token.isdigit():
-        return False
-    return True
+def tokenize(title: str):
+    raw_tokens = title.split(" ")
+    tokens = []
+    for t in raw_tokens:
+        t = re.sub(r"[,\.!?…·:;]", "", t)
+        if not t:
+            continue
+        t = strip_particle(t)
+        tokens.append(t)
+    return tokens
 
 
-def _is_money_topic(phrase: str) -> bool:
-    return any(mk in phrase for mk in MONEY_KEYWORDS)
-
-
-def _unigram_allowed(token: str) -> bool:
-    """
-    한 단어짜리 후보는 아래 둘 중 하나에 해당할 때만 후보로 인정한다.
-      1) GENERIC_SEED_WORDS에 정확히 일치 (환급/대출/보험 등, scorer.py에서 가중치 낮게 처리됨)
-      2) 수익 카테고리 단어를 그 자체로 포함 (예: '피해지원금'처럼 압축된 명사)
-    이 조건에 해당하지 않는 '고유가', '머니투데이' 같은 파편/고유명사는 후보에서 제외한다.
-    """
-    if token in GENERIC_SEED_WORDS:
+def is_blocked_token(word: str) -> bool:
+    if word in BLOCKED_WORDS:
         return True
-    if _is_money_topic(token):
+    if len(word) < 2:
+        return True
+    if re.fullmatch(r"[0-9]+[가-힣]{0,1}", word):
         return True
     return False
 
 
-def fetch_all_titles() -> list:
-    titles = []
-    seen = set()
-    for url in RSS_FEEDS:
-        try:
-            feed = feedparser.parse(url)
-            for entry in feed.entries:
-                t = _clean_title(entry.title)
-                if t and t not in seen:
-                    seen.add(t)
-                    titles.append(t)
-        except Exception as e:
-            print(f"[RSS 수집 실패] {url} -> {e}")
-    return titles
+def is_generic_standalone(word: str) -> bool:
+    """단독 전체 키워드가 범용 명사 그 자체인지 확인."""
+    return word in GENERIC_ROOT_BLOCK
 
 
-def extract_candidates(titles: list) -> list:
-    counter = Counter()
+def is_profit_related(word: str) -> bool:
+    return any(pk in word for pk in PROFIT_KEYWORDS)
 
-    for title in titles:
-        raw_tokens = [tok for tok in title.split(" ") if tok]
-        tokens = [_clean_token(tok) for tok in raw_tokens]
-        tokens = [tok for tok in tokens if tok]
 
-        # 1) unigram - 허용된 경우에만 후보로 인정
-        for tok in tokens:
-            if _is_valid_token(tok) and _unigram_allowed(tok):
-                counter[tok] += 1
+def detect_category(text: str) -> str:
+    for cat, kws in {
+        "보험": ["보험", "실비", "화재보험", "자동차보험"],
+        "대출금융": ["대출", "대환", "중도상환", "금리"],
+        "세금": ["세금", "소득세", "부가세", "연말정산", "환급"],
+        "연금": ["연금", "IRP", "퇴직", "국민연금"],
+        "부동산": ["전세", "청약", "분양", "임대", "부동산"],
+        "지원금": ["지원금", "바우처", "상품권", "수당", "보조금"],
+    }.items():
+        if any(kw in text for kw in kws):
+            return cat
+    return "기타"
 
-        # 2) bigram - 인접 두 어절
-        for i in range(len(tokens) - 1):
-            a, b = tokens[i], tokens[i + 1]
-            if not _is_valid_token(a) or not _is_valid_token(b):
-                continue
-            if b in STOPWORD_TAIL:
-                continue
-            phrase = f"{a} {b}"
-            counter[phrase] += 1
 
-    candidates = []
-    for phrase, mentions in counter.items():
-        if mentions < MIN_MENTION_COUNT:
+def parse_pubdate(pubdate_raw: str):
+    try:
+        dt = parsedate_to_datetime(pubdate_raw)
+        if dt.tzinfo is not None:
+            dt = dt.astimezone(timezone.utc).replace(tzinfo=None)
+        return dt
+    except Exception:
+        return None
+
+
+def recency_score(pubdate_raw: str) -> float:
+    dt = parse_pubdate(pubdate_raw)
+    if dt is None:
+        return 0.3
+    hours = (datetime.utcnow() - dt).total_seconds() / 3600.0
+    if hours < 0:
+        hours = 0
+    if hours <= 3:
+        return 1.0
+    if hours <= 12:
+        return 0.8
+    if hours <= 24:
+        return 0.5
+    if hours <= 48:
+        return 0.3
+    return 0.1
+
+
+def fetch_google_news_rss(query: str, timeout=8):
+    url = GOOGLE_NEWS_RSS.format(query=urllib.parse.quote(query))
+    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        data = resp.read()
+    root = ET.fromstring(data)
+    items = []
+    for item in root.iter("item"):
+        title = item.findtext("title") or ""
+        link = item.findtext("link") or ""
+        pubdate_raw = item.findtext("pubDate") or ""
+        items.append({"title": title, "link": link, "pubdate_raw": pubdate_raw, "source": "google"})
+    return items
+
+
+def fetch_naver_news(query: str, open_api, display=20):
+    raw_items = open_api.search_news(query, display=display)
+    items = []
+    for it in raw_items:
+        title = strip_html(it.get("title", ""))
+        link = it.get("originallink") or it.get("link", "")
+        pubdate_raw = it.get("pubDate", "")
+        items.append({"title": title, "link": link, "pubdate_raw": pubdate_raw, "source": "naver"})
+    return items
+
+
+def generate_candidates_from_article(title: str):
+    """
+    기사 하나(title)에서만 unigram/bigram 후보를 생성한다.
+    - 범용 명사(GENERIC_ROOT_BLOCK)가 '단독 전체 키워드'가 되는 것은 원천 제외.
+    - 서로 다른 기사와는 절대 결합하지 않는다.
+    """
+    cleaned = clean_title(title)
+    tokens = tokenize(cleaned)
+    candidates = set()
+
+    for tok in tokens:
+        if is_blocked_token(tok):
             continue
+        if is_generic_standalone(tok):
+            continue  # '보험', '대출' 단독은 후보 자체에서 제외
+        if is_profit_related(tok) and len(tok) >= 4:
+            candidates.add(tok)
 
-        word_count = len(phrase.split(" "))
-        is_generic = word_count == 1 and phrase in GENERIC_SEED_WORDS
-        money_topic = _is_money_topic(phrase)
+    for i in range(len(tokens) - 1):
+        w1, w2 = tokens[i], tokens[i + 1]
+        if is_blocked_token(w1) or is_blocked_token(w2):
+            continue
+        phrase = f"{w1} {w2}"
+        if phrase in cleaned:
+            candidates.add(phrase)
 
-        candidates.append({
-            "keyword": phrase,
-            "mentions": mentions,
-            "word_count": word_count,
-            "is_generic": is_generic,
-            "money_topic": money_topic,
-        })
-
-    candidates.sort(key=lambda x: x["mentions"], reverse=True)
-    return candidates[:100]
-
-
-def collect_issue_keywords() -> list:
-    titles = fetch_all_titles()
-    return extract_candidates(titles)
+    return candidates, cleaned
 
 
-if __name__ == "__main__":
-    titles = fetch_all_titles()
-    print(f"=== 수집된 뉴스 제목 총 {len(titles)}개 ===")
-    for t in titles[:30]:
-        print("-", t)
+def _collect_raw_pool(open_api, progress_cb=None):
+    pool = {}
+    seen_article_titles = set()
+    total_queries = len(NEWS_QUERIES)
+    done = 0
 
-    candidates = extract_candidates(titles)
-    print(f"\n=== 최종 후보 키워드 총 {len(candidates)}개 ===")
-    for c in candidates[:50]:
-        print(
-            f"{c['keyword']:<20} | mentions={c['mentions']:<3} | "
-            f"word_count={c['word_count']} | is_generic={c['is_generic']} | "
-            f"money_topic={c['money_topic']}"
-        )
+    for category, query in NEWS_QUERIES.items():
+        merged_items = []
+        try:
+            merged_items.extend(fetch_google_news_rss(query))
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"[경고] Google RSS '{category}' 수집 실패: {e}")
+        try:
+            merged_items.extend(fetch_naver_news(query, open_api))
+        except Exception as e:
+            if progress_cb:
+                progress_cb(f"[경고] 네이버뉴스 '{category}' 수집 실패: {e}")
+
+        for item in merged_items:
+            raw_title = item["title"]
+            if not raw_title:
+                continue
+            candidates, cleaned = generate_candidates_from_article(raw_title)
+            if cleaned in seen_article_titles:
+                continue
+            seen_article_titles.add(cleaned)
+
+            rscore = recency_score(item["pubdate_raw"])
+            for kw in candidates:
+                entry = pool.setdefault(kw, {
+                    "keyword": kw, "mentions": 0, "categories": {},
+                    "articles": [], "recency": 0.0, "sources": set(),
+                })
+                entry["mentions"] += 1
+                cat = detect_category(kw + " " + cleaned)
+                entry["categories"][cat] = entry["categories"].get(cat, 0) + 1
+                entry["recency"] = max(entry["recency"], rscore)
+                entry["sources"].add(item["source"])
+                if len(entry["articles"]) < 3:
+                    entry["articles"].append({
+                        "title": cleaned, "link": item["link"], "pubdate": item["pubdate_raw"],
+                    })
+
+        done += 1
+        if progress_cb:
+            progress_cb(f"Discovery 진행 중... ({done}/{total_queries}) '{category}' 완료 "
+                        f"(누적 후보 {len(pool)}개)")
+        time.sleep(0.2)
+
+    result = []
+    for entry in pool.values():
+        entry["category"] = max(entry["categories"], key=entry["categories"].get) if entry["categories"] else "기타"
+        entry["source_count"] = len(entry["sources"])
+        del entry["categories"]
+        del entry["sources"]
+        result.append(entry)
+
+    result.sort(key=lambda e: e["mentions"], reverse=True)
+    return result[:RAW_POOL_CAP]
+
+
+def _lightweight_prefilter(raw_pool, keep_n=PREFILTER_KEEP_N):
+    scored = []
+    for entry in raw_pool:
+        base = entry["mentions"] * 1.0
+        base += entry["recency"] * 1.5
+        base += 0.7 if entry["source_count"] >= 2 else 0.0
+        base += 0.5 if is_profit_related(entry["keyword"]) else 0.0
+        entry["prefilter_score"] = round(base, 2)
+        scored.append(entry)
+    scored.sort(key=lambda e: e["prefilter_score"], reverse=True)
+    return scored[:keep_n]
+
+
+def collect_candidates(open_api, progress_cb=None):
+    raw_pool = _collect_raw_pool(open_api, progress_cb=progress_cb)
+    if progress_cb:
+        progress_cb(f"경량 필터 적용 중... (후보 {len(raw_pool)}개 -> 상위 {PREFILTER_KEEP_N}개 선별)")
+    filtered = _lightweight_prefilter(raw_pool, keep_n=PREFILTER_KEEP_N)
+    return filtered
