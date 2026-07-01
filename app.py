@@ -1,3 +1,6 @@
+# app.py
+# v16.2 - 이슈 수익형 블로그 글 추천기
+
 import csv
 import threading
 import tkinter as tk
@@ -5,7 +8,7 @@ from tkinter import ttk, messagebox, filedialog
 
 from collector import collect_issue_keywords
 from naver_api import get_keyword_data
-from scorer import score_keyword, build_reason_checklist
+from scorer import score_keyword, filter_top5
 from title_engine import make_titles
 from outline_engine import generate_outline
 from gpt_writer import write_draft
@@ -85,7 +88,9 @@ def run_analysis():
             data = get_keyword_data(kw, cid, api, secret)
             if data:
                 for item in data[:5]:
-                    scored = score_keyword(item, meta)
+                    # meta: collector.py가 만든 후보 정보 (첫 번째)
+                    # item: 네이버 API가 돌려준 검색량/경쟁도 정보 (두 번째)
+                    scored = score_keyword(meta, item)
                     results.append(scored)
         except Exception as e:
             error_count += 1
@@ -122,7 +127,8 @@ def run_analysis():
                 r["type"], r["difficulty"]
             ))
         status.config(text=f"완료: {len(unique_results)}개 분석 / API 오류 {error_count}개")
-        build_queue(unique_results[:5])
+        # 비수익 카테고리는 제외하고 진짜 애드포스트 수익형 TOP5만 큐에 반영
+        build_queue(filter_top5(unique_results))
         analyze_button.config(state="normal")
 
     root.after(0, finalize)
@@ -182,7 +188,7 @@ def build_queue(top5):
             "keyword": item["keyword"],
             "final_score": item["final_score"],
             "difficulty": item["difficulty"],
-            "reason": build_reason_checklist(item),
+            "reason": item["reasons"],
             "status": "미작성",
         })
     save_queue(queue_items)
@@ -339,7 +345,7 @@ tree.bind("<<TreeviewSelect>>", lambda e: show_titles())
 right_pane = ttk.PanedWindow(main_pane, orient="vertical")
 main_pane.add(right_pane, weight=4)
 
-queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐")
+queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐 (애드포스트 수익형만 표시)")
 right_pane.add(queue_outer, weight=1)
 
 queue_canvas = tk.Canvas(queue_outer, height=260)
