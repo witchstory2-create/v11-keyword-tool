@@ -1,5 +1,10 @@
 # collector.py
-# v16.2 - 이슈 키워드 후보 수집기
+# v16.3 - 이슈 키워드 후보 수집기
+# 변경 사항(2026-07):
+#   1) 구글 뉴스 RSS 제목 끝에 붙는 " - 언론사명" 부분을 제거
+#      (기존에는 이게 그대로 남아 "머니투데이", "조선일보" 등이 키워드처럼 카운트됨)
+#   2) 한 단어(unigram) 후보는 GENERIC_SEED_WORDS 이거나 수익 카테고리 단어를
+#      직접 포함하는 경우에만 인정. 그 외("고유가" 등 개념 파편)는 후보에서 제외
 
 import re
 import feedparser
@@ -13,6 +18,9 @@ RSS_FEEDS = [
     "https://news.google.com/rss/search?q=보험&hl=ko&gl=KR&ceid=KR:ko",
     "https://news.google.com/rss/search?q=연금&hl=ko&gl=KR&ceid=KR:ko",
 ]
+
+# 언론사명 접미사 패턴: "...제목... - 언론사명" 형태에서 뒤쪽 언론사 부분을 통째로 제거
+PRESS_SUFFIX_PATTERN = re.compile(r"\s*-\s*[^-]{1,20}$")
 
 CLEAN_PATTERN = re.compile(r"[\[\(【].*?[\]\)】]|[\"“”'‘’]|…|·")
 
@@ -36,13 +44,28 @@ BLOCKED_WORDS = {
     "가장", "모든", "많은", "전국", "오늘", "내일",
 }
 
-MIN_MENTION_COUNT = 2  # 결과가 너무 적으면 1로 낮춰서 튜닝
+MONEY_KEYWORDS = [
+    "지원금", "환급", "대출", "보험", "연금", "수당", "복지",
+    "세금", "카드", "혜택", "적금", "예금", "급여", "상품권",
+]
+
+MIN_MENTION_COUNT = 2
+
+
+def _strip_press_suffix(title: str) -> str:
+    """구글 뉴스 제목 끝의 ' - 언론사명' 부분을 제거"""
+    return PRESS_SUFFIX_PATTERN.sub("", title).strip()
 
 
 def _clean_title(title: str) -> str:
+    title = _strip_press_suffix(title)
     title = CLEAN_PATTERN.sub(" ", title)
     title = re.sub(r"\s+", " ", title).strip()
     return title
+
+
+def _clean_token(token: str) -> str:
+    return token.strip(",.!?;:·…\"'()[]{}<>")
 
 
 def _is_valid_token(token: str) -> bool:
@@ -57,6 +80,24 @@ def _is_valid_token(token: str) -> bool:
     if token.isdigit():
         return False
     return True
+
+
+def _is_money_topic(phrase: str) -> bool:
+    return any(mk in phrase for mk in MONEY_KEYWORDS)
+
+
+def _unigram_allowed(token: str) -> bool:
+    """
+    한 단어짜리 후보는 아래 둘 중 하나에 해당할 때만 후보로 인정한다.
+      1) GENERIC_SEED_WORDS에 정확히 일치 (환급/대출/보험 등, scorer.py에서 가중치 낮게 처리됨)
+      2) 수익 카테고리 단어를 그 자체로 포함 (예: '피해지원금'처럼 압축된 명사)
+    이 조건에 해당하지 않는 '고유가', '머니투데이' 같은 파편/고유명사는 후보에서 제외한다.
+    """
+    if token in GENERIC_SEED_WORDS:
+        return True
+    if _is_money_topic(token):
+        return True
+    return False
 
 
 def fetch_all_titles() -> list:
@@ -75,24 +116,20 @@ def fetch_all_titles() -> list:
     return titles
 
 
-def _is_money_topic(phrase: str) -> bool:
-    money_keywords = [
-        "지원금", "환급", "대출", "보험", "연금", "수당", "복지",
-        "세금", "카드", "혜택", "적금", "예금", "급여", "상품권",
-    ]
-    return any(mk in phrase for mk in money_keywords)
-
-
 def extract_candidates(titles: list) -> list:
     counter = Counter()
 
     for title in titles:
-        tokens = [tok for tok in title.split(" ") if tok]
+        raw_tokens = [tok for tok in title.split(" ") if tok]
+        tokens = [_clean_token(tok) for tok in raw_tokens]
+        tokens = [tok for tok in tokens if tok]
 
+        # 1) unigram - 허용된 경우에만 후보로 인정
         for tok in tokens:
-            if _is_valid_token(tok):
+            if _is_valid_token(tok) and _unigram_allowed(tok):
                 counter[tok] += 1
 
+        # 2) bigram - 인접 두 어절
         for i in range(len(tokens) - 1):
             a, b = tokens[i], tokens[i + 1]
             if not _is_valid_token(a) or not _is_valid_token(b):
@@ -124,7 +161,6 @@ def extract_candidates(titles: list) -> list:
 
 
 def collect_issue_keywords() -> list:
-    """app.py에서 호출하는 진입점 함수. 뉴스 수집 + 후보 추출을 한 번에 수행."""
     titles = fetch_all_titles()
     return extract_candidates(titles)
 
