@@ -26,7 +26,7 @@ jobs:
 
       - name: Build EXE
         run: |
-          python -m PyInstaller --clean --onefile --windowed app.py --name keyword_tool --hidden-import=google.generativeai --hidden-import=google.ai.generativelanguage --hidden-import=feedparser --collect-all google-generativeai --collect-all feedparser
+          python -m PyInstaller --clean --onefile --windowed app.py --name keyword_tool
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
