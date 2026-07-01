@@ -7,13 +7,39 @@ from collector import collect_issue_keywords
 from naver_api import get_keyword_data
 from scorer import score_keyword, build_reason_checklist
 from title_engine import make_titles
-from outline_engine import generate_outline, make_writing_guide
+from outline_engine import generate_outline
 from gpt_writer import write_draft
 from queue_manager import save_queue, load_queue
+from config_manager import save_config, load_config
 
 
 analysis_results = []
 queue_items = []
+
+
+# ---------------------- 설정 저장/불러오기 ----------------------
+
+def load_saved_config():
+    cfg = load_config()
+    customer_entry.insert(0, cfg.get("customer_id", ""))
+    api_entry.insert(0, cfg.get("api_key", ""))
+    secret_entry.insert(0, cfg.get("secret_key", ""))
+    gpt_key_entry.insert(0, cfg.get("gemini_key", ""))
+
+
+def save_current_config():
+    save_config({
+        "customer_id": customer_entry.get().strip(),
+        "api_key": api_entry.get().strip(),
+        "secret_key": secret_entry.get().strip(),
+        "gemini_key": gpt_key_entry.get().strip(),
+    })
+    status.config(text="API 키가 저장되었습니다. 다음 실행부터 자동으로 입력됩니다.")
+
+
+def on_close():
+    save_current_config()
+    root.destroy()
 
 
 # ---------------------- 분석 로직 ----------------------
@@ -35,6 +61,7 @@ def run_analysis():
         root.after(0, lambda: analyze_button.config(state="normal"))
         return
 
+    root.after(0, save_current_config)
     root.after(0, lambda: status.config(text="이슈 키워드 수집 중..."))
 
     issue_candidates = collect_issue_keywords()
@@ -110,15 +137,16 @@ def show_titles():
         return
 
     keyword = tree.item(selected[0], "values")[0]
-    render_keyword_detail(keyword)
+    difficulty = tree.item(selected[0], "values")[8] if len(tree.item(selected[0], "values")) > 8 else "보통"
+    render_keyword_detail(keyword, difficulty)
 
 
-def render_keyword_detail(keyword):
+def render_keyword_detail(keyword, difficulty="보통"):
     search_titles, home_titles = make_titles(keyword)
     outline = generate_outline(keyword)
 
     detail_box.delete("1.0", tk.END)
-    detail_box.insert(tk.END, f"키워드: {keyword}\n\n")
+    detail_box.insert(tk.END, f"키워드: {keyword} (난이도: {difficulty})\n\n")
     detail_box.insert(tk.END, "[검색용 제목 3개]\n")
     for i, t in enumerate(search_titles, 1):
         detail_box.insert(tk.END, f"{i}. {t}\n")
@@ -127,20 +155,20 @@ def render_keyword_detail(keyword):
         detail_box.insert(tk.END, f"{i}. {t}\n")
     detail_box.insert(tk.END, "\n[글 개요]\n" + outline["intro"] + "\n")
     detail_box.insert(tk.END, "\n".join(outline["sections"]) + "\n")
-    detail_box.insert(tk.END, "\n[FAQ]\n" + "\n".join(outline["faq"]) + "\n")
-    detail_box.insert(tk.END, "\n[이미지 추천]\n" + "\n".join(outline["image_suggestions"]) + "\n")
+    detail_box.insert(tk.END, "\n[FAQ 항목]\n" + "\n".join(outline["faq"]) + "\n")
     detail_box.insert(tk.END, "\n[태그 추천]\n" + ", ".join(outline["tag_suggestions"]) + "\n")
 
-    gpt_button.config(state="normal", command=lambda: run_gpt_writing(keyword, outline))
+    gpt_button.config(state="normal", command=lambda: run_draft_writing(keyword, outline, difficulty))
 
 
-def run_gpt_writing(keyword, outline):
+def run_draft_writing(keyword, outline, difficulty):
     api_key = gpt_key_entry.get().strip() or None
-    status.config(text="글 작성 중...")
+    status.config(text="글 초안 작성 중...")
     root.update()
-    draft = write_draft(keyword, outline, api_key)
-    detail_box.insert(tk.END, "\n[글 초안]\n" + draft + "\n")
-    status.config(text="글 작성 완료")
+    draft = write_draft(keyword, outline, api_key, difficulty)
+    detail_box.insert(tk.END, "\n" + "=" * 40 + "\n[완성 글 초안 - 그대로 복사해서 사용 가능]\n" + "=" * 40 + "\n\n")
+    detail_box.insert(tk.END, draft + "\n")
+    status.config(text="글 초안 작성 완료. 클립보드 복사 버튼으로 바로 복사할 수 있습니다.")
 
 
 # ---------------------- 오늘의 TOP5 작성 큐 ----------------------
@@ -184,7 +212,7 @@ def render_queue():
 
         btns = tk.Frame(row)
         btns.pack(fill="x", pady=3)
-        tk.Button(btns, text="작성 시작", command=lambda q=q: render_keyword_detail(q["keyword"])).pack(side="left", padx=4)
+        tk.Button(btns, text="작성 시작", command=lambda q=q: render_keyword_detail(q["keyword"], q["difficulty"])).pack(side="left", padx=4)
         tk.Button(btns, text="작성완료 표시", command=lambda q=q: mark_status(q, "작성완료")).pack(side="left", padx=4)
         tk.Button(btns, text="발행완료 표시", command=lambda q=q: mark_status(q, "발행완료")).pack(side="left", padx=4)
 
@@ -235,7 +263,7 @@ def save_as_csv():
 
 root = tk.Tk()
 root.title("v16 이슈 수익형 블로그 글 추천기")
-root.geometry("1400x820")
+root.geometry("1400x850")
 
 title_label = tk.Label(root, text="v16 이슈 수익형 블로그 글 추천기", font=("맑은 고딕", 17, "bold"))
 title_label.pack(pady=8)
@@ -259,11 +287,13 @@ tk.Label(api_frame, text="Gemini API KEY (선택, 무료 발급 가능)").grid(r
 gpt_key_entry = tk.Entry(api_frame, width=45, show="*")
 gpt_key_entry.grid(row=1, column=1, columnspan=3, padx=5, pady=5, sticky="w")
 
+tk.Button(api_frame, text="API 키 저장", command=save_current_config, width=12).grid(row=1, column=4, padx=5, pady=5)
+
 tk.Label(
     api_frame,
-    text="※ https://aistudio.google.com/apikey 에서 무료로 발급 (결제 등록 안 하면 과금 없음)",
+    text="※ 한 번 저장하면 다음 실행부터 자동으로 입력됩니다. (같은 폴더의 config.json에 저장, GitHub에는 올리지 마세요)",
     fg="gray40", font=("맑은 고딕", 8)
-).grid(row=2, column=0, columnspan=4, padx=5, pady=2, sticky="w")
+).grid(row=2, column=0, columnspan=5, padx=5, pady=2, sticky="w")
 
 button_frame = tk.Frame(root)
 button_frame.pack(pady=8, fill="x", padx=15)
@@ -274,7 +304,7 @@ analyze_button.pack(side="left", padx=5)
 title_button = tk.Button(button_frame, text="선택 키워드 상세 보기", command=show_titles, width=20)
 title_button.pack(side="left", padx=5)
 
-gpt_button = tk.Button(button_frame, text="글 초안 생성 (Gemini)", state="disabled", width=18)
+gpt_button = tk.Button(button_frame, text="글 초안 생성", state="disabled", width=15)
 gpt_button.pack(side="left", padx=5)
 
 tk.Button(button_frame, text="클립보드 복사", command=copy_to_clipboard, width=14).pack(side="left", padx=5)
@@ -287,7 +317,6 @@ progress.pack(pady=3)
 main_pane = ttk.PanedWindow(root, orient="horizontal")
 main_pane.pack(fill="both", expand=True, padx=15, pady=8)
 
-# 좌측: 전체 키워드 순위 Treeview
 left_frame = tk.Frame(main_pane)
 main_pane.add(left_frame, weight=3)
 
@@ -307,7 +336,6 @@ tree.column("type", width=100)
 tree.pack(fill="both", expand=True)
 tree.bind("<<TreeviewSelect>>", lambda e: show_titles())
 
-# 우측: 위(작성 큐) + 아래(상세/제목/개요/내보내기)
 right_pane = ttk.PanedWindow(main_pane, orient="vertical")
 main_pane.add(right_pane, weight=4)
 
@@ -325,7 +353,7 @@ queue_canvas.config(yscrollcommand=queue_scrollbar.set)
 queue_canvas.pack(side="left", fill="both", expand=True)
 queue_scrollbar.pack(side="right", fill="y")
 
-detail_frame = tk.LabelFrame(right_pane, text="선택 키워드 상세 (제목 / 개요 / FAQ / 글쓰기)")
+detail_frame = tk.LabelFrame(right_pane, text="선택 키워드 상세 (제목 / 개요 / FAQ / 완성 글 초안)")
 right_pane.add(detail_frame, weight=2)
 
 detail_box = tk.Text(detail_frame, wrap="word")
@@ -335,11 +363,14 @@ status = tk.Label(root, text="대기 중")
 status.pack(pady=5)
 
 
-# ---------------------- 시작 시 오늘 큐 복원 ----------------------
+# ---------------------- 시작 시 설정/큐 복원 ----------------------
+
+load_saved_config()
 
 restored = load_queue()
 if restored:
     queue_items = restored
 render_queue()
 
+root.protocol("WM_DELETE_WINDOW", on_close)
 root.mainloop()
