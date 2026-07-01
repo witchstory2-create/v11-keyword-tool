@@ -1,422 +1,512 @@
 # -*- coding: utf-8 -*-
 """
-collector.py (v18.2) - Discovery 단계 전담
+collector.py (v18.5)
+네이버 블로그 수익형 키워드 발굴 시스템 - 후보 수집/정제 전담 모듈
 
-[이 파일의 역할]
-- 수익형 카테고리별 시드 키워드 관리
-- Google News RSS / 네이버 뉴스 API 조회
-- 기사 제목에서 수익형 후보 문구만 추출 (같은 기사 안에서만 bigram 조합)
-- 언론사명 / 날짜 / 지역명 / 인물명 / 영어 잔재어 제거
-- 후보를 keyword, category, mentions, articles, recency 등 필드로 반환
+[역할]
+  - 무작위 뉴스 수집이 아니라, 수익형 카테고리별 시드 쿼리로만 네이버 뉴스를 조회.
+  - HTML 엔티티, 언론사명, 날짜, 지역명, 인물 호칭 등 일반 뉴스 노이즈를 원천 차단.
+  - 카테고리 앵커(anchor) + 검색의도어(intent word) 조합으로 후보 키워드를 생성.
+  - 수익성 판단(profit_filter)이나 점수화(scorer)는 이 파일의 책임이 아님.
+    여기서는 "깨끗하고 카테고리가 명확한 후보"만 만들어서 넘긴다.
 
-[이 파일이 하지 않는 일 - 다른 파일의 책임]
-- 수익형 여부 재판단, 카테고리 가중치 부여 -> profit_filter.py
-- API로 문서수/검색량/DataLab 조회 -> naver_search_api.py
-- 점수 계산, 등급(TOP5/TOP10/보류/위험) 분류 -> scorer.py
-- 화면 표시 -> app.py
+[출력 계약] collect_candidates()가 반환하는 리스트의 각 원소(dict)는
+  아래 필드를 반드시 포함한다. 이후 모든 다운스트림 모듈은 이 필드명을 그대로 사용한다.
 
-[핵심 설계]
-- "기사 제목 -> 무조건 인접 토큰 조합" 방식을 사용하지 않는다.
-- 카테고리 루트 단어(보험/대출/환급/지원금/연금/세금/청약/부동산/카드)를 포함한 토큰만
-  '앵커(anchor)'로 인정하고, 앵커 단독 또는 앵커+검색의도 단어(신청/환급/할인/인상 등)
-  조합만 후보로 채택한다.
-- 앵커도 의도어도 아닌 토큰(반도체, 상임위, 배재고 등)은 조합 자체가 발생하지 않으므로
-  STOPWORD를 계속 추가하는 임시방편 없이 노이즈가 원천적으로 제거된다.
+    {
+        "keyword"       : str   # 후보 키워드 (예: "민생지원금", "자동차보험 갱신")
+        "category"      : str   # 소속 수익형 카테고리 (예: "지원금")
+        "anchor"        : str   # 이 후보가 매칭된 카테고리 앵커 원형 (예: "지원금")
+        "intent_word"   : str|None  # 함께 검출된 검색의도어 (예: "신청방법"), 없으면 None
+        "mentions"      : int   # 이 키워드가 등장한 서로 다른 뉴스 기사 수
+        "sample_titles" : list[str]  # 근거가 된 원문 기사 제목 샘플 (최대 5개, 정제 후)
+        "seed_query"    : str   # 이 후보를 발견한 시드 검색어
+        "first_pub_date": str   # 최초 발견 기사 발행일 (YYYY-MM-DD, 알 수 없으면 "")
+        "latest_pub_date": str  # 최근 발견 기사 발행일 (YYYY-MM-DD, 알 수 없으면 "")
+    }
+
+  이 필드 외의 값(검색량, 문서수, DataLab, 점수, 등급 등)은 여기서 절대 만들지 않는다.
+  실측치 조회와 판단은 profit_filter.py / scorer.py의 책임이다.
+
+표준 라이브러리만 사용 (urllib, json, re, html, time, datetime, concurrent.futures)
+-> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
 """
 
 import re
 import html
 import time
-import json
-import urllib.request
-import urllib.parse
-import urllib.error
-import xml.etree.ElementTree as ET
+import random
+from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-# ------------------------------------------------------------------
-# 1) 수익형 카테고리 시드 키워드
-#    - 딕셔너리의 key 자체가 카테고리 '루트 단어'로도 사용된다.
-#    - 카테고리를 추가/삭제하려면 이 딕셔너리만 수정하면 된다.
-# ------------------------------------------------------------------
+
+# =========================================================================
+# 1. 수익형 카테고리 시드 & 앵커 정의
+# =========================================================================
+# anchors : 이 카테고리에 속한다고 판단할 "핵심 원형 단어" 목록.
+#           후보 토큰이 이 anchor를 포함하고 있어야 후보로 채택된다.
+# seeds   : 실제 네이버 뉴스 API에 보낼 검색어. anchor보다 구체적으로 잡아서
+#           카테고리 무관 뉴스가 섞여 들어올 확률을 낮춘다.
 CATEGORY_SEEDS = {
-    "보험": ["보험", "실손보험", "자동차보험", "건강보험", "암보험", "보험료"],
-    "대출": ["대출", "신용대출", "전세대출", "정책자금대출", "대출금리"],
-    "환급": ["환급", "세금환급", "환급금", "연말정산 환급", "미환급금"],
-    "지원금": ["지원금", "정부지원금", "청년지원금", "출산지원금", "지원금 신청"],
-    "연금": ["연금", "국민연금", "기초연금", "퇴직연금", "연금개혁"],
-    "세금": ["세금", "종합소득세", "재산세", "자동차세", "종부세"],
-    "청약": ["청약", "주택청약", "특별공급", "청약통장"],
-    "부동산": ["부동산", "전세", "월세", "아파트 분양", "부동산 규제"],
-    "카드": ["카드", "신용카드", "체크카드", "카드혜택", "카드사용"],
+    "지원금": {
+        "anchors": ["지원금", "지원비", "생계비", "생계지원"],
+        "seeds": ["민생지원금", "생계지원금", "긴급지원금", "지원금 신청",
+                   "지원금 대상", "정부지원금", "지자체 지원금"],
+    },
+    "환급": {
+        "anchors": ["환급", "환급금", "환급액"],
+        "seeds": ["세금환급", "보험료환급", "환급금 신청", "건강보험 환급금",
+                   "국민연금 환급", "자동차보험 환급", "환급 대상 조회"],
+    },
+    "보험": {
+        "anchors": ["보험", "보험료", "보험금"],
+        "seeds": ["실손보험", "보험료 인상", "보험금 청구", "보험 리모델링",
+                   "치아보험", "암보험"],
+    },
+    "자동차보험": {
+        "anchors": ["자동차보험", "car보험", "차보험"],
+        "seeds": ["자동차보험 갱신", "자동차보험 비교", "자동차보험료",
+                   "다이렉트 자동차보험", "자동차보험 할인"],
+    },
+    "건강보험": {
+        "anchors": ["건강보험", "건보"],
+        "seeds": ["건강보험료", "건강보험 환급금", "건강보험 피부양자",
+                   "건강보험 지역가입자", "건강보험 본인부담"],
+    },
+    "대출": {
+        "anchors": ["대출", "대환대출", "신용대출"],
+        "seeds": ["대환대출", "신용대출 조건", "정책자금 대출", "전세대출",
+                   "햇살론", "무직자 대출", "대출 한도"],
+    },
+    "연금": {
+        "anchors": ["연금", "국민연금", "퇴직연금", "irp"],
+        "seeds": ["국민연금 조기수령", "퇴직연금 irp", "irp 세액공제",
+                   "연금 수령 나이", "주택연금"],
+    },
+    "세금": {
+        "anchors": ["세금", "세액공제", "종부세", "양도세"],
+        "seeds": ["종합소득세", "연말정산 세액공제", "양도소득세",
+                   "종부세 대상", "부가세 신고"],
+    },
+    "청약": {
+        "anchors": ["청약", "청약통장", "특별공급"],
+        "seeds": ["청약통장 조건", "특별공급 자격", "청약 가점제",
+                   "신혼부부 특별공급", "생애최초 청약"],
+    },
+    "부동산": {
+        "anchors": ["부동산", "재산세", "취득세"],
+        "seeds": ["재산세 조회", "취득세 감면", "부동산 규제지역",
+                   "전월세 신고제"],
+    },
+    "카드": {
+        "anchors": ["카드", "카드혜택", "체크카드"],
+        "seeds": ["카드 캐시백", "카드 연회비", "체크카드 혜택",
+                   "카드 포인트 소멸"],
+    },
 }
 
-CATEGORY_ROOTS = list(CATEGORY_SEEDS.keys())  # 앵커 판정에 사용되는 루트 단어 목록
+# 검색의도어: 후보 키워드가 "정보 검색성"임을 뒷받침하는 접미어.
+# anchor 토큰 옆에 이 단어가 붙어 있으면 별도 bigram 후보로도 채택한다.
+INTENT_WORDS = [
+    "신청", "신청방법", "신청기간", "신청조건", "대상", "대상자", "조건",
+    "자격", "방법", "금액", "한도", "지급일", "지급대상", "확인", "조회",
+    "서류", "접수", "기간", "혜택", "환급대상", "수령", "신청서",
+]
 
-SEED_KEYWORDS_FLAT = set()
-for _seeds in CATEGORY_SEEDS.values():
-    SEED_KEYWORDS_FLAT.update(_seeds)
-
-# ------------------------------------------------------------------
-# 2) 검색의도 단어 - 앵커와 결합했을 때만 후보로 인정하는 수식어
-# ------------------------------------------------------------------
-INTENT_WORDS = {
-    "신청", "대상", "조건", "방법", "신청방법", "신청기간", "접수", "마감",
-    "지급", "지급일", "지급대상", "환급", "환급금", "할인", "인상", "인하",
-    "한도", "기준", "개정", "변경", "확대", "축소", "서류", "절차", "발표",
-    "공고", "조회", "계산", "계산법", "신청서", "자격", "대상자", "만기",
-    "갱신", "가입", "해지", "보장", "특약", "공제", "감면", "면제", "혜택",
-}
-
-# ------------------------------------------------------------------
-# 3) 한글 불용어 (조사/접속어/보조어) - 토큰화 단계에서 1차로 걸러냄
-# ------------------------------------------------------------------
-STOPWORDS = {
-    "그리고", "하지만", "그러나", "이번", "관련", "위해", "통해", "대한",
-    "오늘", "내일", "어제", "이날", "한편", "이에", "따라", "가장",
-    "완전", "정말", "너무", "매우", "관계자는", "밝혔다", "전했다",
-    "것으로", "것이다", "등을", "등이", "됐다", "됐다는", "라며",
-    "있다", "없다", "한다", "했다", "하는", "이라", "이라는", "이런",
-    "저런", "그런", "이제", "지금", "바로", "역시", "또한", "이후",
-}
-
-# ------------------------------------------------------------------
-# 4) 영어/HTML 잔재어
-# ------------------------------------------------------------------
-ENGLISH_STOPWORDS = {
-    "and", "the", "quot", "amp", "com", "for", "with", "you", "are",
-    "this", "that", "was", "will", "have", "from", "your", "pop",
-    "top", "www", "net", "org", "html", "news", "not", "but", "all",
-    "can", "has", "had", "her", "his", "one", "our", "out", "who",
-    "get", "how", "now", "new", "vs",
-}
-
-# ------------------------------------------------------------------
-# 5) 언론사명 (Google News RSS 제목 끝에 "- 언론사"로 붙는 접미사 방어용)
-# ------------------------------------------------------------------
-PRESS_NAMES = {
-    "조선일보", "중앙일보", "동아일보", "한겨레", "경향신문", "한국일보",
+# =========================================================================
+# 2. 노이즈 블랙리스트
+# =========================================================================
+PRESS_NAMES = [
+    "연합뉴스", "조선일보", "중앙일보", "동아일보", "한겨레", "경향신문",
     "매일경제", "한국경제", "서울신문", "국민일보", "세계일보", "문화일보",
-    "머니투데이", "이데일리", "아시아경제", "파이낸셜뉴스", "헤럴드경제",
-    "연합뉴스", "뉴시스", "노컷뉴스", "오마이뉴스", "프레시안", "뉴스1",
-    "YTN", "SBS", "MBC", "KBS", "JTBC", "채널A", "TV조선", "MBN",
-}
+    "아시아경제", "머니투데이", "이데일리", "파이낸셜뉴스", "뉴시스",
+    "뉴스1", "노컷뉴스", "헤럴드경제", "데일리안", "뉴스핌", "전자신문",
+    "디지털타임스", "ZDNet", "지디넷", "블로터", "MBC", "KBS", "SBS",
+    "YTN", "JTBC", "채널A", "TV조선", "MBN", "OSEN", "스포츠동아",
+    "스타뉴스", "톱스타뉴스", "일간스포츠", "매경이코노미", "시사저널",
+    "뉴스토마토", "프레시안", "오마이뉴스", "위키트리", "인사이트",
+    "쿠키뉴스", "메디컬투데이", "청년일보", "브릿지경제", "money",
+]
 
-# ------------------------------------------------------------------
-# 6) 날짜/요일 상시 반복 표현
-# ------------------------------------------------------------------
-DATE_STOPWORDS = {"월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일"}
+LOCATION_STOPWORDS = [
+    "서울", "부산", "대구", "인천", "광주", "대전", "울산", "세종",
+    "경기", "강원", "충북", "충남", "전북", "전남", "경북", "경남", "제주",
+    "강릉", "수원", "성남", "고양", "용인", "청주", "전주", "포항", "창원",
+    "천안", "안산", "안양", "김해", "구미", "춘천", "원주", "여수", "순천",
+    "목포", "제천", "충주", "동해", "속초", "삼척",
+]
 
-# ------------------------------------------------------------------
-# 7) 한국 행정구역명 (지역명 차단)
-# ------------------------------------------------------------------
-PLACE_NAMES = {
-    "서울", "서울시", "부산", "부산시", "대구", "대구시", "인천", "인천시",
-    "광주", "광주시", "대전", "대전시", "울산", "울산시", "세종", "세종시",
-    "경기", "경기도", "강원", "강원도", "충북", "충북도", "충남", "충남도",
-    "전북", "전북도", "전남", "전남도", "경북", "경북도", "경남", "경남도",
-    "제주", "제주도", "수원", "수원시", "성남", "성남시", "용인", "용인시",
-    "고양", "고양시", "청주", "청주시", "전주", "전주시", "여수", "여수시",
-    "순천", "순천시", "포항", "포항시", "창원", "창원시", "진주", "진주시",
-    "강릉", "강릉시", "춘천", "춘천시", "원주", "원주시", "천안", "천안시",
-    "아산", "아산시", "김해", "김해시", "양산", "양산시", "거제", "거제시",
-    "통영", "통영시", "목포", "목포시", "광양", "광양시", "익산", "익산시",
-    "군산", "군산시", "제천", "제천시", "충주", "충주시", "안동", "안동시",
-    "구미", "구미시", "경주", "경주시", "파주", "파주시", "김포", "김포시",
-    "남양주", "남양주시", "평택", "평택시", "안산", "안산시", "안양", "안양시",
-    "부천", "부천시", "시흥", "시흥시", "화성", "화성시", "광명", "광명시",
-    "하남", "하남시", "이천", "이천시", "오산", "오산시", "의정부", "의정부시",
-}
+DATE_STOPWORDS = [
+    "오늘", "내일", "어제", "모레", "이번주", "다음주", "지난주",
+    "월요일", "화요일", "수요일", "목요일", "금요일", "토요일", "일요일",
+    "상반기", "하반기", "1분기", "2분기", "3분기", "4분기",
+]
 
-# ------------------------------------------------------------------
-# 8) 정치인/외국 정상 등 - 일반 뉴스에 반복 등장하지만 수익형 키워드와 무관한 인물명
-# ------------------------------------------------------------------
-PERSON_NAMES = {
-    "시진핑", "푸틴", "트럼프", "바이든", "김정은", "기시다", "이시바",
-    "젤렌스키", "이재명", "한동훈", "조국", "윤석열", "오세훈", "홍준표",
-    "이낙연", "안철수", "나경원",
-}
+# 뉴스 편집/형식 관련 상용어 (기사 제목에서 흔히 붙는 라벨성 단어)
+GENERIC_NEWS_WORDS = [
+    "속보", "단독", "종합", "영상", "포토", "인터뷰", "사설", "칼럼",
+    "오피니언", "이슈", "화제", "리포트", "특보", "브리핑", "논평",
+    "기자수첩", "사진", "그래픽",
+]
 
-PARTICLE_SUFFIX = ("은", "는", "이", "가", "을", "를", "의", "에", "에서",
-                    "으로", "로", "와", "과", "도", "만", "까지", "부터")
+# HTML 엔티티 잔재/영어 잡음
+ENGLISH_STOPWORDS = [
+    "and", "the", "of", "quot", "amp", "nbsp", "com", "co", "kr",
+    "http", "https", "www", "news", "article", "html",
+]
 
+# 인물 호칭 접미어 -> 이 접미어가 붙은 토큰은 인물 언급으로 간주해 제거
+PERSON_SUFFIXES = ["씨", "대표", "의원", "시장", "지사", "총리", "장관",
+                    "청장", "국장", "회장", "위원장", "교수", "박사"]
 
-def _strip_particle(token):
-    """단어 끝에 붙은 조사를 제거한다."""
-    for p in sorted(PARTICLE_SUFFIX, key=len, reverse=True):
-        if len(token) > len(p) + 1 and token.endswith(p):
-            return token[: -len(p)]
-    return token
+# 조사/어미 등 흔한 한국어 접미(단순 규칙 기반 어절 정리용)
+PARTICLE_SUFFIXES = [
+    "으로부터", "에서부터", "까지도", "이라도", "에서는", "에게서",
+    "으로는", "부터는", "에서", "으로", "에게", "까지", "부터", "이라",
+    "라는", "이나", "보다", "처럼", "만큼", "이라는",
+    "이는", "은는", "이에", "에는", "이랑", "이며", "하고",
+    "은", "는", "이", "가", "을", "를", "의", "에", "도", "만", "과", "와", "로",
+]
 
-
-def _clean_title(title):
-    """HTML 엔티티 해제 + 언론사 접미사 제거 + 특수문자 제거"""
-    title = html.unescape(title)  # &quot; &amp; &#39; 등을 실제 문자로 변환
-    # Google News RSS 형식: "헤드라인 - 언론사명" -> 끝의 " - 언론사" 구간 제거
-    title = re.sub(r"\s[-|]\s[^-|]{1,20}$", "", title)
-    title = re.sub(r"\[[^\]]*\]", " ", title)
-    title = re.sub(r"\([^)]*\)", " ", title)
-    title = re.sub(r"<[^>]+>", " ", title)
-    title = re.sub(r"[^가-힣0-9A-Za-z%\s]", " ", title)
-    title = re.sub(r"\s+", " ", title).strip()
-    return title
+BRACKET_PATTERN = re.compile(r"[\[\(【〔《][^\]\)】〕》]*[\]\)】〕》]")
+DATE_NUMERIC_PATTERN = re.compile(
+    r"\d{4}년|\d{1,2}월\s?\d{1,2}일|\d{1,2}\.\d{1,2}\.?|\d{1,2}/\d{1,2}|\d{4}\.\d{1,2}\.\d{1,2}"
+)
+PRESS_SUFFIX_PATTERN = re.compile(
+    r"\s*[-–—|·]\s*(" + "|".join(re.escape(p) for p in PRESS_NAMES) + r")\s*$"
+)
+HTML_TAG_PATTERN = re.compile(r"<[^>]+>")
+NON_KOR_ENG_NUM_PATTERN = re.compile(r"[^가-힣a-zA-Z0-9%\s]")
+PURE_NUMBER_PATTERN = re.compile(r"^\d+[%원]?$")
 
 
-def _is_meaningless_token(t):
-    """의미 없는/무관한 토큰 판정 (언론사명, 날짜, 지역명, 인물명, 영어 잔재어 등)"""
-    if not t:
+# =========================================================================
+# 3. 텍스트 정제 함수
+# =========================================================================
+def _clean_title(raw_title):
+    """HTML 엔티티/태그 제거, 언론사 접미사 제거, 날짜/괄호 표현 제거."""
+    if not raw_title:
+        return ""
+    text = html.unescape(raw_title)
+    text = HTML_TAG_PATTERN.sub("", text)
+    text = BRACKET_PATTERN.sub(" ", text)
+    text = DATE_NUMERIC_PATTERN.sub(" ", text)
+    text = PRESS_SUFFIX_PATTERN.sub("", text)
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
+
+def _strip_particle(word):
+    """어절 끝의 조사를 단순 규칙으로 제거. 제거 후 길이가 너무 짧아지면 원형 유지."""
+    for suf in PARTICLE_SUFFIXES:
+        if word.endswith(suf) and len(word) - len(suf) >= 2:
+            return word[: -len(suf)]
+    return word
+
+
+def _is_person_name_token(token):
+    for suf in PERSON_SUFFIXES:
+        if token.endswith(suf) and len(token) - len(suf) <= 4:
+            return True
+    return False
+
+
+def _is_meaningless_token(token):
+    """노이즈 토큰 여부를 다층 블랙리스트와 패턴으로 판별."""
+    if not token or len(token) < 2:
         return True
-    if t.isdigit():
-        return True
-    if t in PRESS_NAMES or t in DATE_STOPWORDS or t in PLACE_NAMES or t in PERSON_NAMES:
-        return True
-    if re.match(r"^\d{4}년$", t) or re.match(r"^\d{1,2}월$", t) or re.match(r"^\d{1,2}일$", t):
-        return True
-    low = t.lower()
+    low = token.lower()
     if low in ENGLISH_STOPWORDS:
         return True
-    if t.isascii() and t.isalpha() and len(t) <= 4:
+    if token in PRESS_NAMES or token in LOCATION_STOPWORDS:
+        return True
+    if token in DATE_STOPWORDS or token in GENERIC_NEWS_WORDS:
+        return True
+    if _is_person_name_token(token):
+        return True
+    if PURE_NUMBER_PATTERN.match(token):
+        return True
+    if re.fullmatch(r"[a-zA-Z]+", token) and len(token) <= 3:
+        # 짧은 영어 잔재어(and, is, to 등) 차단
+        return True
+    if NON_KOR_ENG_NUM_PATTERN.search(token):
+        # 특수문자/이모지 등이 남아있는 경우
         return True
     return False
 
 
-def _tokenize(title):
+def _tokenize(cleaned_title):
+    """정제된 제목을 어절 단위로 분리하고 조사를 제거한 뒤 노이즈 토큰을 제거."""
+    raw_words = cleaned_title.split(" ")
     tokens = []
-    for raw in _clean_title(title).split(" "):
-        if not raw:
+    for w in raw_words:
+        w = w.strip()
+        if not w:
             continue
-        t = _strip_particle(raw)
-        if len(t) < 2:
+        w = _strip_particle(w)
+        if _is_meaningless_token(w):
             continue
-        if t in STOPWORDS:
-            continue
-        if _is_meaningless_token(t):
-            continue
-        tokens.append(t)
+        tokens.append(w)
     return tokens
 
 
-def _is_pure_seed(phrase):
-    """후보가 시드 키워드 자체와 완전히 동일할 때만 차단(부분 포함이 아닌 완전 일치)"""
-    return phrase in SEED_KEYWORDS_FLAT
-
-
-def _matched_roots(token):
-    """토큰(또는 문구) 안에 포함된 카테고리 루트 단어 목록을 반환"""
-    return [root for root in CATEGORY_ROOTS if root in token]
-
-
-def _is_anchor(token):
-    """토큰이 카테고리 루트 단어를 포함하고 있으면 그 루트를, 아니면 None을 반환"""
-    roots = _matched_roots(token)
-    return roots[0] if roots else None
-
-
-def extract_profit_phrases(title):
+# =========================================================================
+# 4. 후보 키워드 추출 (앵커 + 검색의도어 조합)
+# =========================================================================
+def _extract_candidates_from_tokens(tokens, category, anchors):
     """
-    같은 기사 제목 안에서만 처리한다.
-    - 앵커(카테고리 루트 단어를 포함한 토큰) 단독 -> 후보 (예: 자동차보험, 미환급금)
-    - 앵커 + 검색의도 단어 인접 조합 -> 후보 (예: 보험료 인상, 건강보험 환급)
-    - 앵커 + 앵커 인접 조합 -> 후보 (예: 국민연금 건강보험)
-    - 그 외(앵커도 의도어도 아닌 일반 명사끼리의 조합)는 절대 후보로 만들지 않는다.
-      -> '반도체', '상임위', '배재고' 같은 무관 단어가 조합될 경로 자체를 차단.
-    반환: (candidates 리스트, {후보문구: [매칭된 카테고리 루트]} 딕셔너리)
+    토큰 리스트에서 카테고리 앵커를 포함한 후보를 뽑는다.
+      1) 앵커를 포함하는 단일 토큰 자체가 이미 복합어인 경우 (예: "민생지원금") -> 단독 후보.
+      2) 앵커 토큰과 인접한 검색의도어가 있는 경우 -> "앵커어 의도어" bigram 후보 추가.
     """
-    tokens = _tokenize(title)
     candidates = []
-    categories_by_candidate = {}
+    n = len(tokens)
+    for i, tok in enumerate(tokens):
+        matched_anchor = next((a for a in anchors if a in tok), None)
+        if not matched_anchor:
+            continue
 
-    for t in tokens:
-        if _is_anchor(t) and len(t) >= 3 and not _is_pure_seed(t):
-            candidates.append(t)
-            categories_by_candidate[t] = _matched_roots(t)
+        # (1) 단독 복합어 후보
+        candidates.append({"keyword": tok, "anchor": matched_anchor, "intent_word": None})
 
-    for i in range(len(tokens) - 1):
-        a, b = tokens[i], tokens[i + 1]
-        a_anchor = _is_anchor(a)
-        b_anchor = _is_anchor(b)
-        a_intent = a in INTENT_WORDS
-        b_intent = b in INTENT_WORDS
-
-        phrase = None
-        if a_anchor and b_intent:
-            phrase = f"{a} {b}"
-        elif a_intent and b_anchor:
-            phrase = f"{a} {b}"
-        elif a_anchor and b_anchor:
-            phrase = f"{a} {b}"
-
-        if phrase and not _is_pure_seed(phrase):
-            candidates.append(phrase)
-            categories_by_candidate[phrase] = list(set(_matched_roots(phrase)))
-
-    return candidates, categories_by_candidate
+        # (2) 인접 토큰이 검색의도어인 경우 bigram 후보
+        for j in (i - 1, i + 1):
+            if 0 <= j < n:
+                neighbor = tokens[j]
+                if neighbor in INTENT_WORDS:
+                    if j < i:
+                        phrase = f"{neighbor} {tok}"
+                    else:
+                        phrase = f"{tok} {neighbor}"
+                    candidates.append({
+                        "keyword": phrase,
+                        "anchor": matched_anchor,
+                        "intent_word": neighbor,
+                    })
+    return candidates
 
 
-def fetch_google_news_rss(query, limit=15, timeout=6):
-    """Google News RSS에서 특정 검색어에 대한 기사 목록을 가져온다."""
-    url = "https://news.google.com/rss/search?q=%s&hl=ko&gl=KR&ceid=KR:ko" % urllib.parse.quote(query)
+def _parse_pub_date(raw_pub_date):
+    """네이버 뉴스 API의 pubDate(RFC822 유사 포맷)를 YYYY-MM-DD로 변환. 실패 시 빈 문자열."""
+    if not raw_pub_date:
+        return ""
+    for fmt in ("%a, %d %b %Y %H:%M:%S %z", "%a, %d %b %Y %H:%M:%S %Z"):
+        try:
+            dt = datetime.strptime(raw_pub_date, fmt)
+            return dt.strftime("%Y-%m-%d")
+        except Exception:
+            continue
+    return ""
+
+
+# =========================================================================
+# 5. 뉴스 조회 (카테고리 시드 단위)
+# =========================================================================
+def _fetch_seed_news(search_api, seed_query, pages=2, display=100, log=None):
+    """
+    하나의 시드 쿼리에 대해 네이버 뉴스 API를 조회.
+    search_api는 naver_search_api.NaverSearchAPI 인스턴스를 가정하며,
+    search_news(query, display, start, sort) -> list[dict(title, description, pubDate, link)]
+    형태의 메서드를 제공한다고 가정한다.
+    """
     items = []
-    try:
-        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            data = res.read()
-        root = ET.fromstring(data)
-        for item in root.findall(".//item")[:limit]:
-            title = item.findtext("title") or ""
-            link = item.findtext("link") or ""
-            pub = item.findtext("pubDate") or ""
-            if title:
-                items.append({"title": title, "link": link, "pub": pub, "source": "google_rss"})
-    except Exception:
-        pass
+    for page in range(pages):
+        start = page * display + 1
+        try:
+            result = search_api.search_news(seed_query, display=display, start=start, sort="date")
+            if not result:
+                break
+            items.extend(result)
+            if len(result) < display:
+                break
+        except Exception as e:
+            if log:
+                log(f"[collector] 뉴스 조회 실패 (seed='{seed_query}', page={page}): {e}")
+            break
+        time.sleep(0.15 + random.random() * 0.15)  # API 과호출 방지용 소폭 지연
     return items
 
 
-def fetch_naver_news_by_keyword(client_id, client_secret, keyword, display=15, timeout=6):
-    """네이버 검색 Open API(뉴스)에서 특정 검색어에 대한 기사 목록을 가져온다."""
-    items = []
-    if not client_id or not client_secret:
-        return items
-    url = ("https://openapi.naver.com/v1/search/news.json?query=%s&display=%d&sort=date"
-           % (urllib.parse.quote(keyword), display))
-    try:
-        req = urllib.request.Request(url, headers={
-            "X-Naver-Client-Id": client_id,
-            "X-Naver-Client-Secret": client_secret,
-        })
-        with urllib.request.urlopen(req, timeout=timeout) as res:
-            j = json.loads(res.read().decode("utf-8", errors="replace"))
-        for it in j.get("items", []):
-            title = re.sub(r"<[^>]+>", "", it.get("title", ""))
-            title = html.unescape(title)
-            items.append({"title": title, "link": it.get("link", ""),
-                          "pub": it.get("pubDate", ""), "source": "naver_news"})
-    except Exception:
-        pass
-    return items
+def _process_seed(search_api, category, seed_query, anchors, log=None):
+    """시드 쿼리 하나를 처리하여 (category, seed_query, 후보 리스트, 원문기사 메타)를 반환."""
+    news_items = _fetch_seed_news(search_api, seed_query, log=log)
+    local_agg = {}  # keyword -> {"mentions":set(article_id), "sample_titles":[], "anchor", "intent_word", pub dates}
+
+    for item in news_items:
+        raw_title = item.get("title", "")
+        raw_desc = item.get("description", "")
+        pub_date = _parse_pub_date(item.get("pubDate", ""))
+        link = item.get("link") or item.get("originallink") or raw_title
+
+        cleaned_title = _clean_title(raw_title)
+        cleaned_desc = _clean_title(raw_desc)
+        combined_text = f"{cleaned_title} {cleaned_desc}".strip()
+        if not combined_text:
+            continue
+
+        tokens = _tokenize(combined_text)
+        if not tokens:
+            continue
+
+        found = _extract_candidates_from_tokens(tokens, category, anchors)
+        for cand in found:
+            key = cand["keyword"]
+            if key not in local_agg:
+                local_agg[key] = {
+                    "keyword": key,
+                    "category": category,
+                    "anchor": cand["anchor"],
+                    "intent_word": cand["intent_word"],
+                    "mentions_set": set(),
+                    "sample_titles": [],
+                    "seed_query": seed_query,
+                    "first_pub_date": pub_date,
+                    "latest_pub_date": pub_date,
+                }
+            entry = local_agg[key]
+            entry["mentions_set"].add(link)
+            if cleaned_title and cleaned_title not in entry["sample_titles"] and len(entry["sample_titles"]) < 5:
+                entry["sample_titles"].append(cleaned_title)
+            # intent_word가 있는 후보를 우선(더 구체적인 정보이므로) 갱신
+            if cand["intent_word"] and not entry["intent_word"]:
+                entry["intent_word"] = cand["intent_word"]
+            if pub_date:
+                if not entry["first_pub_date"] or pub_date < entry["first_pub_date"]:
+                    entry["first_pub_date"] = pub_date
+                if not entry["latest_pub_date"] or pub_date > entry["latest_pub_date"]:
+                    entry["latest_pub_date"] = pub_date
+
+    return local_agg
 
 
-def _parse_pubdate_to_epoch(pub):
-    """RFC822 형식(pubDate) 문자열을 epoch 시간(float)으로 변환. 실패하면 None."""
-    if not pub:
-        return None
-    try:
-        from email.utils import parsedate_to_datetime
-        dt = parsedate_to_datetime(pub)
-        return dt.timestamp()
-    except Exception:
-        return None
-
-
-def _fetch_one_seed(category, seed, client_id, client_secret):
-    """하나의 (카테고리, 시드) 조합에 대해 구글+네이버 뉴스를 모두 수집"""
-    articles = []
-    articles += fetch_google_news_rss(seed, limit=15)
-    articles += fetch_naver_news_by_keyword(client_id, client_secret, seed, display=15)
-    return category, seed, articles
-
-
-def collect_candidates(search_api=None, discovery_target=100, light_filter_target=40, log=None,
-                        max_workers=8):
+# =========================================================================
+# 6. 메인 인터페이스
+# =========================================================================
+def collect_candidates(search_api, discovery_target=None, light_filter_target=None,
+                        log=None, max_workers=4, max_per_category=60):
     """
-    Discovery 전담 함수.
+    수익형 카테고리 뉴스를 수집하고, 노이즈를 제거한 후보 키워드 리스트를 반환한다.
 
-    처리 순서:
-    1) CATEGORY_SEEDS에 등록된 모든 (카테고리, 시드) 조합에 대해
-       Google News RSS + 네이버 뉴스 API를 병렬로 조회한다.
-    2) 각 기사 제목에서 extract_profit_phrases()로 '앵커 기반' 후보만 추출한다.
-    3) 후보별로 언급 건수(mentions), 참고 기사(articles, 최대 3개),
-       최근성(recency, 시간 단위)을 집계한다.
-    4) mentions 기준으로 상위 discovery_target개를 1차 선별하고,
-       범용 시드 자체(generic_flag)는 뒤로 밀어 light_filter_target개로 축소한다.
+    Parameters
+    ----------
+    search_api : naver_search_api.NaverSearchAPI
+        뉴스 검색을 수행할 API 클라이언트. search_news(query, display, start, sort) 필요.
+    discovery_target : list[str] | None
+        수집 대상 카테고리 이름 목록. None이면 CATEGORY_SEEDS의 전체 카테고리를 사용.
+    light_filter_target : list[str] | None
+        추가로 포함하고 싶은 보조 시드 키워드 목록(선택). 각 카테고리에 매칭되는 항목만 반영.
+    log : callable | None
+        로그 출력 콜백. log(message:str) 형태.
+    max_workers : int
+        시드 쿼리 병렬 조회 스레드 수.
+    max_per_category : int
+        카테고리별로 반환할 최대 후보 수(멘션 수 기준 상위 N개). 다운스트림 부담 완화용.
 
-    반환되는 각 후보 딕셔너리 필드:
-      - keyword       : 후보 문구
-      - category      : 매칭된 수익형 카테고리(복수 가능, 콤마 구분)
-      - mentions      : 뉴스 언급 건수(중복 기사 집계)
-      - articles      : 실제 기사 목록(최대 3개, title/link/source/pub 포함)
-      - recency       : 가장 최근 기사로부터 경과 시간(시간 단위, float). 알 수 없으면 None.
-      - matched_seed  : 이 후보를 발견하게 된 시드 키워드 목록(콤마 구분)
-      - generic_flag  : 후보가 시드 키워드 자체와 완전히 동일한지 여부
+    Returns
+    -------
+    list[dict] : 위 "출력 계약"에 정의된 필드를 가진 후보 딕셔너리 리스트.
     """
-    def _log(msg):
+    categories = discovery_target if discovery_target else list(CATEGORY_SEEDS.keys())
+    categories = [c for c in categories if c in CATEGORY_SEEDS]
+    if not categories:
         if log:
-            log(msg)
+            log("[collector] 유효한 카테고리가 없어 전체 카테고리로 진행합니다.")
+        categories = list(CATEGORY_SEEDS.keys())
 
-    client_id = search_api.client_id if search_api else None
-    client_secret = search_api.client_secret if search_api else None
+    # 보조 시드 키워드 병합(선택)
+    extra_by_category = {}
+    if light_filter_target:
+        for cat in categories:
+            anchors = CATEGORY_SEEDS[cat]["anchors"]
+            matched = [kw for kw in light_filter_target if any(a in kw for a in anchors)]
+            if matched:
+                extra_by_category[cat] = matched
 
-    tasks = [(category, seed) for category, seeds in CATEGORY_SEEDS.items() for seed in seeds]
-    _log(f"[collector] 카테고리 {len(CATEGORY_SEEDS)}개 / 시드 {len(tasks)}개 조회 시작")
+    tasks = []  # (category, seed_query, anchors)
+    for cat in categories:
+        anchors = CATEGORY_SEEDS[cat]["anchors"]
+        seeds = list(CATEGORY_SEEDS[cat]["seeds"]) + extra_by_category.get(cat, [])
+        for seed in seeds:
+            tasks.append((cat, seed, anchors))
 
-    cand_map = {}
-    now = time.time()
-    total_articles = 0
+    if log:
+        log(f"[collector] 수집 대상 카테고리: {', '.join(categories)} (시드 쿼리 {len(tasks)}건)")
+
+    global_agg = {}  # (category, keyword) -> aggregated entry
 
     with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_fetch_one_seed, cat, seed, client_id, client_secret)
-                   for cat, seed in tasks]
-        for future in as_completed(futures):
+        future_map = {
+            executor.submit(_process_seed, search_api, cat, seed, anchors, log): (cat, seed)
+            for cat, seed, anchors in tasks
+        }
+        for future in as_completed(future_map):
+            cat, seed = future_map[future]
             try:
-                search_category, seed, articles = future.result()
+                local_agg = future.result()
             except Exception as e:
-                _log(f"[collector] 시드 수집 실패: {e}")
+                if log:
+                    log(f"[collector] 시드 처리 실패 (category='{cat}', seed='{seed}'): {e}")
                 continue
 
-            total_articles += len(articles)
-            for art in articles:
-                title = art.get("title", "")
-                if not title:
-                    continue
-                pub_epoch = _parse_pubdate_to_epoch(art.get("pub", ""))
-                phrases, cat_map = extract_profit_phrases(title)
-                for p in set(phrases):
-                    entry = cand_map.setdefault(p, {
-                        "keyword": p,
-                        "categories": set(),
-                        "matched_seeds": set(),
-                        "mentions": 0,
-                        "articles": [],
-                        "latest_epoch": None,
-                    })
-                    entry["mentions"] += 1
-                    entry["categories"].update(cat_map.get(p, [search_category]))
-                    entry["matched_seeds"].add(seed)
-                    if len(entry["articles"]) < 3:
-                        entry["articles"].append({
-                            "title": title, "link": art.get("link", ""),
-                            "source": art.get("source", "unknown"), "pub": art.get("pub", ""),
-                        })
-                    if pub_epoch is not None:
-                        if entry["latest_epoch"] is None or pub_epoch > entry["latest_epoch"]:
-                            entry["latest_epoch"] = pub_epoch
+            for key, entry in local_agg.items():
+                gkey = (cat, key)
+                if gkey not in global_agg:
+                    global_agg[gkey] = entry
+                else:
+                    g = global_agg[gkey]
+                    g["mentions_set"] |= entry["mentions_set"]
+                    for t in entry["sample_titles"]:
+                        if t not in g["sample_titles"] and len(g["sample_titles"]) < 5:
+                            g["sample_titles"].append(t)
+                    if entry["intent_word"] and not g["intent_word"]:
+                        g["intent_word"] = entry["intent_word"]
+                    if entry["first_pub_date"] and (
+                        not g["first_pub_date"] or entry["first_pub_date"] < g["first_pub_date"]
+                    ):
+                        g["first_pub_date"] = entry["first_pub_date"]
+                    if entry["latest_pub_date"] and (
+                        not g["latest_pub_date"] or entry["latest_pub_date"] > g["latest_pub_date"]
+                    ):
+                        g["latest_pub_date"] = entry["latest_pub_date"]
 
-    _log(f"[collector] 수집 기사 수(중복 포함): {total_articles}")
+            if log:
+                log(f"[collector] 완료: category='{cat}', seed='{seed}', 신규 후보 {len(local_agg)}건")
 
-    candidates = []
-    for c in cand_map.values():
-        keyword = c["keyword"]
-        if len(keyword.replace(" ", "")) < 2:
-            continue
-        recency = None
-        if c["latest_epoch"] is not None:
-            recency = round((now - c["latest_epoch"]) / 3600.0, 2)  # 시간 단위
-        candidates.append({
-            "keyword": keyword,
-            "category": ", ".join(sorted(c["categories"])),
-            "mentions": c["mentions"],
-            "articles": c["articles"],
-            "recency": recency,
-            "matched_seed": ", ".join(sorted(c["matched_seeds"])),
-            "generic_flag": _is_pure_seed(keyword),
-        })
+    # 카테고리별 상위 max_per_category개로 컷하고 최종 출력 계약 형태로 변환
+    by_category = {}
+    for (cat, key), entry in global_agg.items():
+        by_category.setdefault(cat, []).append(entry)
 
-    candidates.sort(key=lambda x: x["mentions"], reverse=True)
-    candidates = candidates[:discovery_target]
-    _log(f"[collector] 1차 후보 수(앵커+검색의도 기반, 카테고리 매칭 확인됨): {len(candidates)}")
+    result = []
+    for cat, entries in by_category.items():
+        entries.sort(key=lambda e: len(e["mentions_set"]), reverse=True)
+        for entry in entries[:max_per_category]:
+            result.append({
+                "keyword": entry["keyword"],
+                "category": entry["category"],
+                "anchor": entry["anchor"],
+                "intent_word": entry["intent_word"],
+                "mentions": len(entry["mentions_set"]),
+                "sample_titles": entry["sample_titles"],
+                "seed_query": entry["seed_query"],
+                "first_pub_date": entry["first_pub_date"],
+                "latest_pub_date": entry["latest_pub_date"],
+            })
 
-    candidates.sort(key=lambda x: (x["generic_flag"], -x["mentions"]))
-    result = candidates[:light_filter_target]
-    _log(f"[collector] 경량 필터 후 profit_filter 전달 대상: {len(result)}")
+    if log:
+        log(f"[collector] 최종 후보 수: {len(result)}건 (카테고리 {len(by_category)}개)")
+
     return result
+
+
+if __name__ == "__main__":
+    # 간단한 단독 실행 테스트(실제 API 키 없이는 동작하지 않음. 구조 확인용).
+    class _DummyAPI:
+        def search_news(self, query, display=100, start=1, sort="date"):
+            return []
+
+    def _print_log(msg):
+        print(msg)
+
+    res = collect_candidates(_DummyAPI(), discovery_target=["지원금"], log=_print_log)
+    print(f"결과 {len(res)}건")
