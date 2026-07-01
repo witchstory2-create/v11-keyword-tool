@@ -1,371 +1,257 @@
-# scorer.py
-# v16.9 - 이모지(🔥,ℹ,⚠) 표시가 Windows 기본 글꼴에서 깨지는 문제를 해결하기 위해
-#         모든 표시 문구를 일반 텍스트([급증], [평이], [주의] 등)로 교체.
-#         나머지 로직(광고 경쟁도 배율, 글작성순위, 트렌드 재검증)은 v16.8과 완전히 동일.
+# -*- coding: utf-8 -*-
+"""
+scorer.py (v17 - 수익형 키워드 발굴기)
+
+Verification 데이터(문서수/검색량/DataLab)를 받아
+IssueScore / OpportunityScore를 계산하고,
+위험 판정 + 스파이크 하드컷을 적용해 최종 버킷을 분류한다.
+
+버킷 종류: TOP5 / TOP10 / 상시추천 / 보류 / 위험
+"""
 
 import math
 
-EXPONENT_BY_SPECIFICITY = {
-    "generic": 0.30,
-    "specific_single": 0.60,
-    "multiword": 0.85,
+CATEGORY_WEIGHTS = {
+    "보험": 1.4, "대출금융": 1.3, "세금": 1.3, "연금": 1.2,
+    "부동산": 1.1, "지원금": 1.0, "기타": 0.8,
 }
 
-TRAFFIC_CAPTURE_RATE = {
-    "generic": 0.5,
-    "specific_single": 0.4,
-    "multiword": 0.3,
+# collector.py의 GENERIC_ROOT_BLOCK과 동일한 개념.
+# bigram 등 조합형 키워드 안에 이 단어가 '포함'되어 있고 문서수가 과도하면 위험 처리.
+GENERIC_ROOT_WORDS = {
+    "보험", "대출", "연금", "환급", "지원", "지원금", "정부", "세금", "카드",
 }
 
-DEFAULT_AD_CLICK_RATE = 0.02
-
-CATEGORY_CPC_KRW = {
-    "보험": 100,
-    "대출": 80,
-    "세금": 60,
-    "연금": 55,
-    "지원금": 25,
-    "환급": 20,
-    "상품권": 20,
-}
-
-MONEY_CATEGORY_KEYWORDS = list(CATEGORY_CPC_KRW.keys())
-DEFAULT_CPC_KRW = 15
-
-AD_DEPTH_BASELINE = 3.0
-AD_DEPTH_MAX_MULTIPLIER = 4.0
-
-NON_MONEY_PROFIT_CAP = 8.0
-NEW_ISSUE_MENTION_THRESHOLD = 4
-
-TYPE_CODE_MAP = {
-    "HOT 이슈": "HOT_ISSUE",
-    "수익형 정기": "RECURRING_PROFIT",
-    "비수익(제외권장)": "NON_PROFIT",
-    "보류": "RECURRING_PROFIT",
-    "주의": "RECURRING_PROFIT",
-}
-
-DIFFICULTY_LEVEL_MAP = {
-    "쉬움": 1,
-    "보통": 2,
-    "어려움": 3,
-}
-
-DIFFICULTY_INDEX_MAP = {1: 1.0, 2: 1.8, 3: 2.8}
-
-HOT_ISSUE_BASE_WEIGHT = 2.0
-HOT_ISSUE_MAX_WEIGHT = 3.0
-HOT_ISSUE_MENTION_SCALE = 20
-
-RECURRING_PROFIT_WEIGHT = 1.0
-NON_PROFIT_WEIGHT = 0.3
-
-SPIKE_RATIO_HOT_THRESHOLD = 2.0
+SPIKE_HARDCUT = 1.3          # 이 미만이면 '이슈성 없음(상시성)'으로 강등
+STEADY_OPPORTUNITY_MIN = 0.55  # 상시성이어도 이 이상이면 '상시추천'으로 별도 표시
+RISK_DOC_COUNT_WITH_GENERIC = 300_000   # 범용어 포함 + 이 이상 문서수 -> 위험
+RISK_DOC_COUNT_ABSOLUTE = 1_000_000     # 범용어 여부와 무관하게 이 이상이면 무조건 위험
 
 
-def _detect_category(keyword: str) -> str:
-    for cat in MONEY_CATEGORY_KEYWORDS:
-        if cat in keyword:
-            return cat
-    return "기타"
+def profit_label(weight: float) -> str:
+    if weight >= 1.3:
+        return "상"
+    if weight >= 1.0:
+        return "중"
+    return "하"
 
 
-def _get_specificity_tier(candidate: dict) -> str:
-    if candidate.get("is_generic"):
-        return "generic"
-    if candidate.get("word_count", 1) == 1:
-        return "specific_single"
-    return "multiword"
+def star_rating(final_score: float) -> str:
+    if final_score >= 85:
+        return "★★★★★"
+    if final_score >= 70:
+        return "★★★★☆"
+    if final_score >= 55:
+        return "★★★☆☆"
+    if final_score >= 40:
+        return "★★☆☆☆"
+    if final_score >= 25:
+        return "★☆☆☆☆"
+    return "☆☆☆☆☆"
 
 
-def _get_issue_weight(candidate: dict) -> float:
-    tier = _get_specificity_tier(candidate)
-    return {"generic": 0.15, "specific_single": 0.7, "multiword": 1.0}[tier]
+def _minmax_normalize(values):
+    finite = [v for v in values if v is not None]
+    if not finite:
+        return [0.0 for _ in values]
+    lo, hi = min(finite), max(finite)
+    if hi - lo < 1e-9:
+        return [0.5 if v is not None else 0.0 for v in values]
+    return [(v - lo) / (hi - lo) if v is not None else 0.0 for v in values]
 
 
-def _apply_relkeyword_discount(candidate: dict, naver_data: dict) -> float:
-    seed = candidate["keyword"]
-    rel_keyword = naver_data.get("relKeyword", seed) if naver_data else seed
-    if seed not in rel_keyword:
-        return 0.3
+def saturation_multiplier(doc_count):
+    if doc_count is None:
+        return 0.6
+    if doc_count > 1_000_000:
+        return 0.10
+    if doc_count > 300_000:
+        return 0.25
+    if doc_count > 100_000:
+        return 0.50
+    if doc_count > 30_000:
+        return 0.80
     return 1.0
 
 
-def _calculate_issue_score(candidate: dict, naver_data: dict) -> float:
-    weight = _get_issue_weight(candidate)
-    discount = _apply_relkeyword_discount(candidate, naver_data)
-    adjusted_mentions = candidate["mentions"] * weight * discount
-    return round(math.log2(adjusted_mentions + 1) * 10, 2)
+def contains_generic_root(keyword: str) -> str or None:
+    """키워드에 포함된 범용 명사가 있으면 그 단어를 반환, 없으면 None."""
+    for root in GENERIC_ROOT_WORDS:
+        if root in keyword:
+            return root
+    return None
 
 
-def _get_ad_depth_multiplier(naver_data: dict) -> float:
-    depth = float(naver_data.get("plAvgDepth", 0) or 0)
-    multiplier = 1.0 + (depth / AD_DEPTH_BASELINE)
-    return min(multiplier, AD_DEPTH_MAX_MULTIPLIER)
+def efficiency_label(search_volume, doc_count):
+    """검색량 대비 문서수 비율을 사람이 이해할 수 있는 등급으로 변환."""
+    if not search_volume or doc_count is None:
+        return None, "효율 미검증"
+    ratio = search_volume / max(doc_count, 1)
+    if ratio >= 5:
+        return ratio, "효율 매우 좋음"
+    if ratio >= 1:
+        return ratio, "효율 좋음"
+    if ratio >= 0.1:
+        return ratio, "효율 보통"
+    return ratio, "효율 나쁨(경쟁 과다)"
 
 
-def _get_effective_click_rate(naver_data: dict) -> float:
-    ctr_pc = float(naver_data.get("monthlyAvePcCtr", 0) or 0)
-    ctr_mobile = float(naver_data.get("monthlyAveMobileCtr", 0) or 0)
-    ctr_values = [c for c in (ctr_pc, ctr_mobile) if c > 0]
-    if not ctr_values:
-        return DEFAULT_AD_CLICK_RATE
-    avg_ctr_percent = sum(ctr_values) / len(ctr_values)
-    return avg_ctr_percent / 100.0
+def compute_scores(candidates: list):
+    if not candidates:
+        return []
 
+    mentions_list = [c.get("mentions", 0) for c in candidates]
+    spike_list = [min(c.get("spike_ratio", 1.0) or 1.0, 5.0) for c in candidates]
+    volume_list = [math.log1p(c.get("search_volume") or 0) for c in candidates]
+    recency_list = [c.get("recency", 0.3) for c in candidates]
 
-def estimate_monthly_revenue(candidate: dict, naver_data: dict) -> dict:
-    pc_count = int(naver_data.get("monthlyPcQcCnt", 0) or 0)
-    mobile_count = int(naver_data.get("monthlyMobileQcCnt", 0) or 0)
-    total_search = pc_count + mobile_count
+    norm_mentions = _minmax_normalize(mentions_list)
+    norm_spike = _minmax_normalize(spike_list)
+    norm_volume = _minmax_normalize(volume_list)
+    norm_recency = _minmax_normalize(recency_list)
 
-    category = _detect_category(candidate["keyword"])
-    is_money_category = category != "기타"
-    base_cpc = CATEGORY_CPC_KRW.get(category, DEFAULT_CPC_KRW)
+    # 검색량 대비 문서수 비율(효율)을 기회점수의 핵심 축으로 강화
+    efficiency_raw = []
+    for c in candidates:
+        vol = (c.get("search_volume") or 0) + 1
+        doc = c.get("doc_count")
+        doc_for_log = doc if (doc is not None and doc > 0) else 500_000
+        raw = vol / (math.log(doc_for_log + 10) ** 1.5)  # 문서수 페널티를 더 강하게
+        efficiency_raw.append(raw)
+    norm_efficiency = _minmax_normalize(efficiency_raw)
 
-    ad_depth_multiplier = _get_ad_depth_multiplier(naver_data)
-    cpc_estimate = base_cpc * ad_depth_multiplier
-    click_rate = _get_effective_click_rate(naver_data)
-
-    tier = _get_specificity_tier(candidate)
-    alpha = EXPONENT_BY_SPECIFICITY[tier]
-    capture_rate = TRAFFIC_CAPTURE_RATE[tier]
-
-    new_issue_special_case = False
-    low_search_high_value = False
-
-    if total_search > 0:
-        effective_demand = total_search ** alpha
-        estimated_visits = effective_demand * capture_rate
-        if total_search < 1000 and ad_depth_multiplier >= 1.8:
-            low_search_high_value = True
-    else:
-        if candidate["mentions"] >= NEW_ISSUE_MENTION_THRESHOLD and is_money_category:
-            new_issue_special_case = True
-            proxy_demand = candidate["mentions"] * 10
-            effective_demand = proxy_demand ** alpha
-            estimated_visits = effective_demand * capture_rate
-        else:
-            estimated_visits = 0.5
-
-    estimated_clicks = estimated_visits * click_rate
-    estimated_revenue_krw = estimated_clicks * cpc_estimate
-
-    return {
-        "category": category,
-        "is_money_category": is_money_category,
-        "pc": pc_count,
-        "mobile": mobile_count,
-        "estimated_visits": round(estimated_visits, 1),
-        "estimated_revenue_krw": round(estimated_revenue_krw, 1),
-        "ad_depth_multiplier": round(ad_depth_multiplier, 2),
-        "click_rate_used": round(click_rate * 100, 2),
-        "new_issue_special_case": new_issue_special_case,
-        "low_search_high_value": low_search_high_value,
-        "tier": tier,
-    }
-
-
-def _calculate_profit_score(revenue_info: dict) -> float:
-    raw = math.log2(revenue_info["estimated_revenue_krw"] + 1) * 10
-    if not revenue_info["is_money_category"]:
-        raw = min(raw, NON_MONEY_PROFIT_CAP)
-    return round(raw, 2)
-
-
-def _calculate_final_score(issue_score: float, profit_score: float, is_money_category: bool) -> float:
-    base = issue_score * 0.6 + profit_score * 0.4
-    if not is_money_category:
-        base *= 0.5
-    return round(base, 2)
-
-
-def get_difficulty(candidate: dict, naver_data: dict) -> str:
-    competition = naver_data.get("compIdx", "중간")
-    category = _detect_category(candidate["keyword"])
-
-    high_effort_categories = {"보험", "대출", "세금"}
-    if category in high_effort_categories or competition == "높음":
-        return "어려움"
-    if competition == "낮음" and candidate.get("word_count", 1) >= 2:
-        return "쉬움"
-    return "보통"
-
-
-def _build_reason_checklist(candidate: dict, revenue_info: dict, trend_info: dict = None) -> list:
-    trend_info = trend_info or {}
-    reasons = []
-    revenue_text = f"예상 월수익 약 {revenue_info['estimated_revenue_krw']:,.0f}원 (추정, 실제와 다를 수 있음)"
-    reasons.append(revenue_text)
-
-    # [FIXED] 이모지 대신 일반 텍스트 태그 사용
-    if trend_info.get("trend_available"):
-        spike = trend_info.get("spike_ratio", 1.0)
-        if spike >= SPIKE_RATIO_HOT_THRESHOLD:
-            reasons.insert(0, f"[급증 확인] 실제 검색량이 평소 대비 x{spike}배 증가")
-        else:
-            reasons.append(f"[평이] 뉴스 언급은 많지만 검색량은 평소와 비슷함(x{spike}) - 상시성 키워드로 판단")
-
-    if revenue_info.get("low_search_high_value"):
-        reasons.append(
-            f"[숨은고수익] 조회수는 낮지만 광고 경쟁도 높음(배율 x{revenue_info['ad_depth_multiplier']}) "
-            "- 실제 단가가 높아 숨은 고수익 키워드일 가능성"
+    results = []
+    for i, c in enumerate(candidates):
+        issue_score = (
+            0.3 * norm_mentions[i] + 0.3 * norm_spike[i]
+            + 0.2 * norm_volume[i] + 0.2 * norm_recency[i]
         )
-    if candidate["mentions"] >= 5 and not candidate.get("is_generic"):
-        reasons.append("뉴스 언급 증가")
-    if candidate.get("word_count", 1) >= 2:
-        reasons.append("구체적 이슈 (신규 블로그도 상위노출 가능성 있음)")
-    if revenue_info["is_money_category"]:
-        reasons.append("장기 검색 가능 카테고리")
-    if revenue_info.get("new_issue_special_case"):
-        reasons.append("신규 이슈 (검색량 데이터 미반영, 뉴스 언급 기반 추정)")
-    if candidate.get("is_generic"):
-        reasons.append("[주의] 범용 레드오션 키워드 - 검색량은 크지만 실제 유입은 매우 제한적")
-    if not revenue_info["is_money_category"]:
-        reasons.append("[주의] 수익 카테고리 미매칭 - 애드포스트 수익성 낮을 가능성")
-    return reasons
+        sat_mult = saturation_multiplier(c.get("doc_count"))
+        opportunity_score = norm_efficiency[i] * sat_mult
 
+        cat = c.get("category", "기타")
+        cat_weight = CATEGORY_WEIGHTS.get(cat, 0.8)
 
-def _categorize(final_score: float, issue_score: float, profit_score: float,
-                 is_money_category: bool, is_generic: bool,
-                 spike_ratio: float = None, trend_available: bool = False) -> str:
-    if not is_money_category:
-        return "비수익(제외권장)"
+        # 가중합 방식: 기회점수(문서수/검색량 비율)에 더 큰 비중(0.65)
+        final_raw = (0.35 * issue_score + 0.65 * opportunity_score) * cat_weight
 
-    is_hot_candidate = issue_score >= 25 and profit_score >= 40 and not is_generic
+        eff_ratio, eff_label = efficiency_label(c.get("search_volume"), c.get("doc_count"))
 
-    if is_hot_candidate:
-        if trend_available and spike_ratio is not None and spike_ratio < SPIKE_RATIO_HOT_THRESHOLD:
-            return "수익형 정기"
-        return "HOT 이슈"
+        results.append({
+            **c,
+            "issue_score": round(issue_score, 3),
+            "opportunity_score": round(opportunity_score, 3),
+            "category_weight": cat_weight,
+            "profit_label": profit_label(cat_weight),
+            "final_raw": final_raw,
+            "efficiency_ratio": round(eff_ratio, 3) if eff_ratio is not None else None,
+            "efficiency_label": eff_label,
+        })
 
-    if profit_score >= 45:
-        return "수익형 정기"
-    if final_score < 8:
-        return "보류"
-    return "주의"
+    final_raws = [r["final_raw"] for r in results]
+    norm_final = _minmax_normalize(final_raws)
+    for r, nf in zip(results, norm_final):
+        r["final_score"] = round(nf * 100, 1)
 
+    # ---------------- 위험 판정 ----------------
+    for r in results:
+        generic_hit = contains_generic_root(r["keyword"])
+        doc = r.get("doc_count")
+        risk = False
+        risk_reasons = []
 
-def calculate_writing_priority(revenue_krw: float, difficulty_level: int, keyword_type_code: str, mentions: int = 0) -> dict:
-    difficulty_index = DIFFICULTY_INDEX_MAP.get(difficulty_level, 2.0)
+        if doc is not None and doc > RISK_DOC_COUNT_ABSOLUTE:
+            risk = True
+            risk_reasons.append(f"문서수 {doc:,}건으로 극단적 과포화")
+        elif generic_hit and doc is not None and doc > RISK_DOC_COUNT_WITH_GENERIC:
+            risk = True
+            risk_reasons.append(f"범용 단어 '{generic_hit}' 포함 + 문서수 {doc:,}건 과포화")
 
-    if keyword_type_code == "HOT_ISSUE":
-        urgency_weight = HOT_ISSUE_BASE_WEIGHT + min(mentions / HOT_ISSUE_MENTION_SCALE, 1.0)
-        urgency_weight = min(urgency_weight, HOT_ISSUE_MAX_WEIGHT)
-        guidance = "오늘 작성 권장 (실시간 이슈, 신선도 감쇠 빠름)"
-    elif keyword_type_code == "RECURRING_PROFIT":
-        urgency_weight = RECURRING_PROFIT_WEIGHT
-        difficulty_text = {1: "하", 2: "중", 3: "상"}.get(difficulty_level, "중")
-        guidance = f"여유있게 작성 가능 (수익형 정기, 난이도 {difficulty_text})"
-    else:  # NON_PROFIT
-        urgency_weight = NON_PROFIT_WEIGHT
-        guidance = "작성 비권장 (수익화 어려움)"
+        r["risk"] = risk
+        r["risk_reasons"] = risk_reasons
 
-    priority_score = (revenue_krw / difficulty_index) * urgency_weight
-
-    return {
-        "priority_score": round(priority_score, 1),
-        "guidance": guidance,
-        "difficulty_index": difficulty_index,
-        "urgency_weight": round(urgency_weight, 2),
-    }
-
-
-def score_keyword(candidate: dict, naver_data: dict = None, trend_info: dict = None) -> dict:
-    naver_data = naver_data or {}
-    trend_info = trend_info or {}
-
-    issue_score = _calculate_issue_score(candidate, naver_data)
-    revenue_info = estimate_monthly_revenue(candidate, naver_data)
-    profit_score = _calculate_profit_score(revenue_info)
-    final_score = _calculate_final_score(issue_score, profit_score, revenue_info["is_money_category"])
-    difficulty = get_difficulty(candidate, naver_data)
-
-    keyword_type = _categorize(
-        final_score, issue_score, profit_score,
-        revenue_info["is_money_category"], candidate.get("is_generic", False),
-        spike_ratio=trend_info.get("spike_ratio"),
-        trend_available=trend_info.get("trend_available", False),
-    )
-    reasons = _build_reason_checklist(candidate, revenue_info, trend_info)
-
-    type_code = TYPE_CODE_MAP.get(keyword_type, "RECURRING_PROFIT")
-    difficulty_level = DIFFICULTY_LEVEL_MAP.get(difficulty, 2)
-    priority_info = calculate_writing_priority(
-        revenue_krw=revenue_info["estimated_revenue_krw"],
-        difficulty_level=difficulty_level,
-        keyword_type_code=type_code,
-        mentions=candidate["mentions"],
-    )
-
-    return {
-        "keyword": candidate["keyword"],
-        "mentions": candidate["mentions"],
-        "pc": revenue_info["pc"],
-        "mobile": revenue_info["mobile"],
-        "competition": naver_data.get("compIdx", "중간"),
-        "issue_score": issue_score,
-        "profit_score": profit_score,
-        "final_score": final_score,
-        "type": keyword_type,
-        "type_code": type_code,
-        "difficulty": difficulty,
-        "difficulty_level": difficulty_level,
-        "money_category": revenue_info["category"],
-        "is_money_category": revenue_info["is_money_category"],
-        "estimated_revenue_krw": revenue_info["estimated_revenue_krw"],
-        "estimated_visits": revenue_info["estimated_visits"],
-        "ad_depth_multiplier": revenue_info["ad_depth_multiplier"],
-        "low_search_high_value": revenue_info["low_search_high_value"],
-        "new_issue_special_case": revenue_info["new_issue_special_case"],
-        "reasons": reasons,
-        "writing_priority_score": priority_info["priority_score"],
-        "writing_guidance": priority_info["guidance"],
-        "urgency_weight": priority_info["urgency_weight"],
-        "trend_checked": trend_info.get("trend_available", False),
-        "spike_ratio": trend_info.get("spike_ratio"),
-    }
-
-
-def recheck_with_trend(scored_result: dict, trend_info: dict) -> dict:
-    keyword_type = _categorize(
-        scored_result["final_score"], scored_result["issue_score"], scored_result["profit_score"],
-        scored_result["is_money_category"], False,
-        spike_ratio=trend_info.get("spike_ratio"),
-        trend_available=trend_info.get("trend_available", False),
-    )
-
-    type_code = TYPE_CODE_MAP.get(keyword_type, "RECURRING_PROFIT")
-    priority_info = calculate_writing_priority(
-        revenue_krw=scored_result["estimated_revenue_krw"],
-        difficulty_level=scored_result["difficulty_level"],
-        keyword_type_code=type_code,
-        mentions=scored_result["mentions"],
-    )
-
-    # [FIXED] 이모지 문자열 대신 텍스트 태그로 중복 검사
-    reasons = [r for r in scored_result["reasons"] if "급증 확인" not in r and "[평이]" not in r]
-    if trend_info.get("trend_available"):
-        spike = trend_info.get("spike_ratio", 1.0)
-        if spike >= SPIKE_RATIO_HOT_THRESHOLD:
-            reasons.insert(0, f"[급증 확인] 실제 검색량이 평소 대비 x{spike}배 증가")
+    # ---------------- 스파이크 하드컷 ----------------
+    for r in results:
+        spike = r.get("spike_ratio", 1.0) or 1.0
+        if spike < SPIKE_HARDCUT:
+            r["issue_status_final"] = "상시성"
         else:
-            reasons.append(f"[평이] 뉴스 언급은 많지만 검색량은 평소와 비슷함(x{spike}) - 상시성 키워드로 판단")
+            r["issue_status_final"] = r.get("trend_status", "상승")
 
-    scored_result["type"] = keyword_type
-    scored_result["type_code"] = type_code
-    scored_result["writing_priority_score"] = priority_info["priority_score"]
-    scored_result["writing_guidance"] = priority_info["guidance"]
-    scored_result["urgency_weight"] = priority_info["urgency_weight"]
-    scored_result["reasons"] = reasons
-    scored_result["trend_checked"] = trend_info.get("trend_available", False)
-    scored_result["spike_ratio"] = trend_info.get("spike_ratio")
+    # ---------------- 순위 부여 (위험 제외 대상만 랭킹) ----------------
+    non_risk = [r for r in results if not r["risk"]]
+    non_risk.sort(key=lambda r: r["final_score"], reverse=True)
+    for rank, r in enumerate(non_risk, start=1):
+        r["rank"] = rank
 
-    return scored_result
+    risk_items = [r for r in results if r["risk"]]
+    risk_items.sort(key=lambda r: r["final_score"], reverse=True)
+    for r in risk_items:
+        r["rank"] = None  # 위험 항목은 정식 순위에서 제외
+
+    # ---------------- 버킷 분류 ----------------
+    for r in results:
+        if r["risk"]:
+            r["bucket"] = "위험"
+        elif r["issue_status_final"] == "상시성":
+            r["bucket"] = "상시추천" if r["opportunity_score"] >= STEADY_OPPORTUNITY_MIN else "보류"
+        elif r["rank"] is not None and r["rank"] <= 5:
+            r["bucket"] = "TOP5"
+        elif r["rank"] is not None and r["rank"] <= 15:
+            r["bucket"] = "TOP10"
+        else:
+            r["bucket"] = "보류"
+
+    for r in results:
+        r["stars"] = star_rating(r["final_score"])
+        r["reason_tags"] = _build_reason_tags(r)
+
+    # 최종 정렬: 위험은 맨 아래, 그 외는 점수 내림차순
+    results.sort(key=lambda r: (r["risk"], -r["final_score"]))
+    return results
 
 
-def filter_top5(scored_keywords: list) -> list:
-    money_only = [k for k in scored_keywords if k["is_money_category"]]
-    money_only.sort(key=lambda x: x["writing_priority_score"], reverse=True)
-    return money_only[:5]
+def _build_reason_tags(r):
+    tags = []
+
+    mentions = r.get("mentions", 0)
+    src_cnt = r.get("source_count", 1)
+    if mentions >= 3:
+        src_txt = " (구글+네이버 동시 언급)" if src_cnt >= 2 else ""
+        tags.append(f"뉴스 언급 {mentions}건{src_txt}")
+
+    spike = r.get("spike_ratio")
+    status = r.get("trend_status", "미검증")
+    if spike is not None:
+        if r["issue_status_final"] == "상시성":
+            tags.append(f"DataLab 상승률 x{spike:.2f} (이슈성 낮음, 상시성)")
+        elif status == "급증":
+            tags.append(f"DataLab 급증 x{spike:.2f}")
+        elif status == "상승":
+            tags.append(f"DataLab 상승 x{spike:.2f}")
+        else:
+            tags.append("DataLab 미검증")
+
+    doc_count = r.get("doc_count")
+    if doc_count is not None:
+        tags.append(f"문서수 {doc_count:,}건")
+    else:
+        tags.append("문서수 미검증")
+
+    vol = r.get("search_volume")
+    if vol:
+        tags.append(f"검색량 {vol:,}회/월")
+
+    if r.get("efficiency_label"):
+        eff_txt = r["efficiency_label"]
+        if r.get("efficiency_ratio") is not None:
+            eff_txt += f" (검색량÷문서수={r['efficiency_ratio']:.2f})"
+        tags.append(eff_txt)
+
+    tags.append(f"예상 수익성 {r.get('profit_label', '-')}")
+
+    if r.get("risk"):
+        for reason in r.get("risk_reasons", []):
+            tags.append(f"[위험] {reason}")
+
+    return tags
