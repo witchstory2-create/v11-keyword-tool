@@ -35,7 +35,7 @@ DEFAULT_KEYWORDS = [
 
 
 def fetch_news_items():
-    """RSS에서 제목 리스트만 수집한다. (뉴스 항목 파싱)"""
+    """RSS에서 제목 리스트만 수집한다."""
     items = []
     for url in RSS_URLS:
         try:
@@ -82,7 +82,8 @@ def extract_bigrams(title):
 def collect_issue_keywords():
     """
     반환값: [{"keyword": str, "mentions": int, "is_money_topic": bool}, ...]
-    뉴스에 실제로 등장한 단어/단어쌍만 후보로 인정한다. 인위적 조합 생성은 하지 않는다.
+    뉴스에 실제로 등장한 단어/단어쌍만 후보로 인정한다.
+    돈이 되는 주제와 무관한 bigram은 후보에서 제외한다(노이즈 필터링).
     """
     titles = fetch_news_items()
 
@@ -96,6 +97,7 @@ def collect_issue_keywords():
 
     candidates = {}
 
+    # 단일 단어 후보: 돈이 되는 주제어가 실제 빈도 이상 등장했을 때만
     for word, cnt in word_counter.items():
         if cnt >= MIN_MENTION_COUNT and any(topic in word for topic in MONEY_TOPICS):
             candidates[word] = {
@@ -104,17 +106,23 @@ def collect_issue_keywords():
                 "is_money_topic": True,
             }
 
+    # 인접 단어쌍 후보: 실제로 나란히 등장한 조합 중, 돈이 되는 주제와 관련 있는 것만
     for pair, cnt in bigram_counter.items():
-        if cnt >= MIN_MENTION_COUNT:
-            has_money = any(topic in pair for topic in MONEY_TOPICS)
-            if pair not in candidates:
-                candidates[pair] = {
-                    "keyword": pair,
-                    "mentions": cnt,
-                    "is_money_topic": has_money,
-                }
+        if cnt < MIN_MENTION_COUNT:
+            continue
 
-    # 오늘 뉴스에서 후보가 부족할 경우를 대비한 기본 시드 키워드 (mentions=0으로 표시, 신뢰도 낮음)
+        has_money = any(topic in pair for topic in MONEY_TOPICS)
+        if not has_money:
+            continue  # 돈과 무관한 노이즈 조합은 후보에서 제외
+
+        if pair not in candidates:
+            candidates[pair] = {
+                "keyword": pair,
+                "mentions": cnt,
+                "is_money_topic": has_money,
+            }
+
+    # 오늘 뉴스에서 후보가 부족할 경우를 대비한 기본 시드 키워드 (mentions=0, 신뢰도 낮음)
     for kw in DEFAULT_KEYWORDS:
         if kw not in candidates:
             candidates[kw] = {
