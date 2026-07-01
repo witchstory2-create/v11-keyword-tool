@@ -1,19 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-app.py (v19)
+app.py (v20)
 네이버 블로그 수익형 키워드 발굴 시스템 - 대시보드형 UI
 
-사용 흐름: [분석 시작] -> [요약바에서 등급 확인] -> [표에서 키워드 클릭]
-           -> [우측 상세에서 추천 이유 확인] -> [하단에서 글초안/제목/FAQ 작성]
-
-API 설정은 상단 메뉴 '설정 > API 설정'에서만 접근 가능한 별도 팝업창으로 분리.
-평소 화면에는 절대 노출되지 않음.
+[v20 변경 사항 - 최소 수정]
+1) 키워드 복사 기능 추가: 결과 표에서 더블클릭 / Ctrl+C / 우클릭(컨텍스트 메뉴)
+   세 가지 방식으로 선택한 키워드를 클립보드에 복사할 수 있다. 복사 성공 시
+   하단 상태바에 "'키워드' 키워드가 복사되었습니다." 메시지가 3초간 표시된다.
+2) 글초안 생성 가능 등급 확장: 기존에는 TOP5/TOP10만 콘텐츠 생성이 가능했으나,
+   "보류"는 "오늘 우선순위가 낮다"는 의미일 뿐 작성 불가 키워드가 아니므로
+   보류 등급도 생성 가능하도록 변경했다. "위험" 등급만 생성이 차단된다.
+   (ALLOWED_DRAFT_GRADES 상수만 수정, 글초안/제목/FAQ 생성 로직 자체는 그대로 유지)
+3) API 상태 표시 버그 수정: 기존 SettingsDialog의 연결 테스트 버튼들이
+   self.cfg["api_status"]를 bool 값으로 덮어써서, 연결 테스트를 누르는 순간
+   메인 화면 상단의 "API 상태"가 실제 분석 결과가 아니라 연결 테스트 결과로
+   바뀌어버리는 문제가 있었다. v20에서는 연결 테스트 버튼이 더 이상
+   self.cfg["api_status"]를 건드리지 않으며, 이 값은 오직 scorer.py가 반환한
+   api_health(분석 종료 후 실제 호출 결과)로만 갱신된다.
+4) naver_search_api.py v18.9의 reset_retry_stats()/get_retry_stats()를 사용해
+   분석 시작 전 429/timeout 집계를 초기화하고, 분석 종료 후 로그에 발생
+   횟수를 출력한다.
 
 파이프라인:
   collector.collect_candidates()   -> 후보 수집
   profit_filter.filter_candidates()-> 수익형 필터링(카테고리 가중치/검색의도)
-  scorer.score_candidates()        -> 4단계 교차검증 + 점수화 + 등급 분류
-                                       (v18.6부터 (results, api_health) 튜플 반환)
+  scorer.score_candidates()        -> 5단계 검증 + 점수화 + 등급 분류
+                                       ((results, api_health) 튜플 반환)
 
 표준 라이브러리(tkinter)만 사용 -> PyInstaller / GitHub Actions 빌드 호환.
 외부 유료 AI API, 추가 pip 패키지 사용하지 않음.
@@ -34,10 +46,13 @@ from tkinter import ttk, messagebox, filedialog, scrolledtext
 import collector
 import profit_filter
 import scorer
-from naver_search_api import NaverSearchAPI, NaverDataLabAPI, NaverAdsAPI
+from naver_search_api import (
+    NaverSearchAPI, NaverDataLabAPI, NaverAdsAPI,
+    reset_retry_stats, get_retry_stats,
+)
 
 APP_TITLE = "오늘의 수익형 키워드 발굴기"
-APP_VERSION = "v19"
+APP_VERSION = "v20"
 
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -54,6 +69,9 @@ GRADE_COLOR = {
     "위험":   {"bg": "#FBE0E0", "fg": "#B02B2B", "row_bg": "#FDEDED"},
 }
 MEDALS = {1: "🥇", 2: "🥈", 3: "🥉"}
+
+# [v20 신규] 글초안 생성 가능 등급 - "위험"만 차단, "보류"는 허용
+ALLOWED_DRAFT_GRADES = {"TOP5", "TOP10", "보류"}
 
 DEFAULT_CONFIG = {
     "naver_client_id": "",
@@ -122,6 +140,10 @@ class SettingsDialog(tk.Toplevel):
         ttk.Button(tab1, text="데이터랩 API 테스트", command=self._test_datalab).grid(row=3, column=1, pady=10, sticky="w")
         self.status1 = ttk.Label(tab1, text="", foreground="#555555")
         self.status1.grid(row=4, column=0, columnspan=2, sticky="w")
+        ttk.Label(tab1, text="※ 이 테스트 결과는 이 창에만 표시되며, 메인 화면의 'API 상태'는 "
+                              "실제 분석 종료 후 결과로만 갱신됩니다.",
+                  foreground="#999999", wraplength=480, justify="left").grid(
+            row=5, column=0, columnspan=2, sticky="w", pady=(6, 0))
 
         ttk.Label(tab2, text="searchad.naver.com 별도 인증 정보 (Customer ID / License Key / Secret Key)",
                   foreground="#777777").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
@@ -160,12 +182,16 @@ class SettingsDialog(tk.Toplevel):
         self.cfg["categories"] = [c for c, v in self.category_vars.items() if v.get()]
         return self.cfg
 
+    # -----------------------------------------------------------------
+    # [v20 수정] 연결 테스트는 이 창의 상태 라벨(status1/status2)에만 결과를
+    # 표시하고, 더 이상 self.cfg["api_status"]를 덮어쓰지 않는다.
+    # 메인 화면의 "API 상태"는 오직 분석 종료 후 api_health로만 갱신된다.
+    # -----------------------------------------------------------------
     def _test_search(self):
         cfg = self._current_values()
         api = NaverSearchAPI(cfg["naver_client_id"], cfg["naver_client_secret"])
         ok, msg, hint = api.test_connection()
         text = ("✔ " if ok else "✘ ") + msg + (f"\n{hint}" if hint else "")
-        self.cfg["api_status"]["search"] = bool(ok)
         self.status1.config(text=text, foreground="#2E7D32" if ok else "#C62828")
 
     def _test_datalab(self):
@@ -173,7 +199,6 @@ class SettingsDialog(tk.Toplevel):
         api = NaverDataLabAPI(cfg["naver_client_id"], cfg["naver_client_secret"])
         ok, msg, hint = api.test_connection()
         text = ("✔ " if ok else "✘ ") + msg + (f"\n{hint}" if hint else "")
-        self.cfg["api_status"]["datalab"] = bool(ok)
         self.status1.config(text=text, foreground="#2E7D32" if ok else "#C62828")
 
     def _test_ads(self):
@@ -181,7 +206,6 @@ class SettingsDialog(tk.Toplevel):
         api = NaverAdsAPI(cfg["ads_customer_id"], cfg["ads_license_key"], cfg["ads_secret_key"])
         ok, msg, hint = api.test_connection()
         text = ("✔ " if ok else "✘ ") + msg + (f"\n{hint}" if hint else "")
-        self.cfg["api_status"]["ads"] = bool(ok)
         self.status2.config(text=text, foreground="#2E7D32" if ok else "#C62828")
 
     def _save(self):
@@ -246,7 +270,6 @@ def build_recommendation(data):
     if data.get("timing") in ("오늘", "오후"):
         badges.append("오늘 작성 추천")
 
-    # reason_tags가 이미 scorer.py에서 만들어졌다면 그대로 병합해 보여준다.
     for tag in data.get("reason_tags", []):
         if tag not in badges:
             badges.append(tag)
@@ -425,7 +448,8 @@ class WritingPanel(ttk.Frame):
         top.pack(fill="x", pady=(0, 4))
         self.gen_btn = ttk.Button(top, text="✎ 콘텐츠 생성", command=self._generate, state="disabled")
         self.gen_btn.pack(side="left")
-        self.hint_label = ttk.Label(top, text="TOP5 / TOP10 키워드만 콘텐츠 생성이 가능합니다.",
+        # [v20] 보류도 생성 가능 -> 안내 문구 수정
+        self.hint_label = ttk.Label(top, text="위험 등급 키워드는 콘텐츠 생성이 불가능합니다.",
                                      foreground="#999999")
         self.hint_label.pack(side="left", padx=(10, 0))
 
@@ -450,12 +474,13 @@ class WritingPanel(ttk.Frame):
 
     def set_selected(self, data):
         self.data = data
-        if data and data.get("grade") in ("TOP5", "TOP10"):
+        # [v20 수정] TOP5/TOP10 뿐 아니라 "보류"도 생성 가능. "위험"만 차단.
+        if data and data.get("grade") in ALLOWED_DRAFT_GRADES:
             self.gen_btn.config(state="normal")
             self.hint_label.config(text="")
         else:
             self.gen_btn.config(state="disabled")
-            self.hint_label.config(text="TOP5 / TOP10 키워드만 콘텐츠 생성이 가능합니다.")
+            self.hint_label.config(text="위험 등급 키워드는 콘텐츠 생성이 불가능합니다.")
 
     def _generate(self):
         if not self.data:
@@ -484,12 +509,14 @@ class App(tk.Tk):
         self.queue = queue.Queue()
         self.worker_thread = None
         self.item_map = {}  # treeview row id -> data dict
+        self._status_after_id = None  # [v20] 상태바 메시지 자동 소거용
 
         self._build_menu()
         self._build_header()
         self._build_summary_bar()
         self._build_body()
         self._build_writing_panel()
+        self._build_status_bar()  # [v20 신규] 반드시 다른 위젯들보다 나중에 pack (맨 아래 위치)
         self._poll_queue()
 
     # ---------------------------------------------------------------
@@ -582,8 +609,9 @@ class App(tk.Tk):
         self.summary_labels["위험"].config(text=str(counts["위험"]))
         self.summary_labels["성공률"].config(text=f"{rate:.0f}%")
 
-        # ★ api_status는 이제 scorer.score_candidates()가 반환한 api_health 딕셔너리
-        #    {"search": "ok"|"partial"|"fail", "ads": ..., "datalab": ...} 형태.
+        # [v20] 이 값은 오직 scorer.score_candidates()가 반환한 api_health
+        # (실제 분석 결과)로만 갱신된다. 설정창의 연결 테스트 버튼은 더 이상
+        # 이 값을 건드리지 않는다.
         status = self.cfg.get("api_status", {})
         vals = [status.get(k) for k in ("search", "datalab", "ads")]
         if vals and all(v == "ok" for v in vals):
@@ -640,6 +668,12 @@ class App(tk.Tk):
 
         self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
 
+        # [v20 신규] 키워드 복사 기능 - 더블클릭 / Ctrl+C / 우클릭
+        self.tree.bind("<Double-1>", self._on_tree_double_click)
+        self.tree.bind("<Control-c>", self._on_tree_ctrl_c)
+        self.tree.bind("<Button-3>", self._on_tree_right_click)
+        self._build_context_menu()
+
         # ---- 우측: 상세 패널 ----
         right = ttk.Frame(paned, padding=(12, 0, 0, 0))
         paned.add(right, weight=2)
@@ -647,11 +681,69 @@ class App(tk.Tk):
         self.detail_panel.pack(fill="both", expand=True)
 
     # ---------------------------------------------------------------
+    # [v20 신규] 키워드 복사 기능
+    # ---------------------------------------------------------------
+    def _build_context_menu(self):
+        self.context_menu = tk.Menu(self, tearoff=0)
+        self.context_menu.add_command(label="키워드 복사", command=self._copy_context_target_keyword)
+        self._context_menu_target_row = None
+
+    def _copy_keyword_to_clipboard(self, keyword):
+        if not keyword:
+            return
+        self.clipboard_clear()
+        self.clipboard_append(keyword)
+        self._show_status(f"'{keyword}' 키워드가 복사되었습니다.")
+
+    def _on_tree_double_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        data = self.item_map.get(row_id)
+        if data:
+            self._copy_keyword_to_clipboard(data.get("keyword", ""))
+
+    def _on_tree_ctrl_c(self, event=None):
+        sel = self.tree.selection()
+        if not sel:
+            return
+        data = self.item_map.get(sel[0])
+        if data:
+            self._copy_keyword_to_clipboard(data.get("keyword", ""))
+
+    def _on_tree_right_click(self, event):
+        row_id = self.tree.identify_row(event.y)
+        if row_id and row_id in self.item_map:
+            self.tree.selection_set(row_id)
+            self._context_menu_target_row = row_id
+            self.context_menu.tk_popup(event.x_root, event.y_root)
+
+    def _copy_context_target_keyword(self):
+        data = self.item_map.get(self._context_menu_target_row)
+        if data:
+            self._copy_keyword_to_clipboard(data.get("keyword", ""))
+
+    # ---------------------------------------------------------------
     def _build_writing_panel(self):
         wrap = ttk.LabelFrame(self, text="콘텐츠 작성", padding=10)
-        wrap.pack(fill="both", expand=False, padx=14, pady=(0, 14))
+        wrap.pack(fill="both", expand=False, padx=14, pady=(0, 6))
         self.writing_panel = WritingPanel(wrap)
         self.writing_panel.pack(fill="both", expand=True)
+
+    # ---------------------------------------------------------------
+    # [v20 신규] 하단 상태바 - 복사 완료 등의 안내 메시지 표시
+    # ---------------------------------------------------------------
+    def _build_status_bar(self):
+        self.status_bar = ttk.Label(self, text="준비", anchor="w",
+                                     relief="sunken", padding=(8, 3))
+        self.status_bar.pack(fill="x", side="bottom")
+
+    def _show_status(self, message, ms=3000):
+        self.status_bar.config(text=message)
+        if self._status_after_id:
+            try:
+                self.after_cancel(self._status_after_id)
+            except Exception:
+                pass
+        self._status_after_id = self.after(ms, lambda: self.status_bar.config(text="준비"))
 
     # ---------------------------------------------------------------
     def _log(self, msg):
@@ -693,6 +785,9 @@ class App(tk.Tk):
                 self._open_settings()
             return
 
+        # [v20 신규] 이번 분석 실행의 429/timeout 집계를 초기화
+        reset_retry_stats()
+
         self.run_btn.config(state="disabled")
         self.progress.pack(side="right", padx=(0, 10))
         self.progress_label.pack(side="right", padx=(0, 6))
@@ -707,12 +802,6 @@ class App(tk.Tk):
         )
         self.worker_thread.start()
 
-    # =================================================================
-    # ★★★ 수정된 함수 ①: _worker
-    #     scorer.score_candidates()가 (results, api_health) 튜플을
-    #     반환하도록 v18.6에서 바뀌었으므로, 그에 맞춰 두 값을 함께 받아
-    #     딕셔너리 형태로 큐에 전달한다.
-    # =================================================================
     def _worker(self, categories, max_workers):
         try:
             search_api = NaverSearchAPI(self.cfg["naver_client_id"], self.cfg["naver_client_secret"])
@@ -733,7 +822,6 @@ class App(tk.Tk):
             filtered = profit_filter.filter_candidates(candidates, log=self._log)
             self._log(f"수익형 필터 통과: {len(filtered)}건")
 
-            # ★ scorer.py v18.6: (results, api_health) 튜플 반환
             results, api_health = scorer.score_candidates(filtered, apis, log=self._log)
             self._log(f"점수 산출 및 등급 분류 완료: {len(results)}건")
             self._log(
@@ -741,7 +829,13 @@ class App(tk.Tk):
                 f"광고:{api_health.get('ads')} DataLab:{api_health.get('datalab')}"
             )
 
-            # ★ results 단독이 아니라 results + api_health를 함께 전달
+            # [v20 신규] 429/timeout 실제 발생 횟수 로그
+            retry_stats = get_retry_stats()
+            self._log(
+                f"API 재시도 집계 - 429 발생 {retry_stats.get('count_429', 0)}회, "
+                f"timeout 발생 {retry_stats.get('count_timeout', 0)}회"
+            )
+
             self.queue.put(("done", {"results": results, "api_health": api_health}))
         except Exception as e:
             tb = traceback.format_exc()
@@ -749,11 +843,6 @@ class App(tk.Tk):
             self._log(tb)
             self.queue.put(("error", str(e)))
 
-    # =================================================================
-    # ★★★ 수정된 함수 ②: _on_analysis_done
-    #     payload가 이제 {"results":..., "api_health":...} 딕셔너리이므로
-    #     이를 풀어서 self.results와 self.cfg["api_status"]에 각각 반영한다.
-    # =================================================================
     def _on_analysis_done(self, payload):
         self.progress.stop()
         self.progress.pack_forget()
@@ -765,11 +854,21 @@ class App(tk.Tk):
         self.cfg["last_run"] = datetime.now().strftime("%m-%d %H:%M")
         save_config(self.cfg)
 
-        self._log(f"=== 분석 종료: 총 {len(self.results)}건 ===")
+        counts = {g: 0 for g in GRADE_ORDER}
+        for d in self.results:
+            g = d.get("grade")
+            if g in counts:
+                counts[g] += 1
+        self._log(
+            f"=== 분석 종료: 총 {len(self.results)}건 - "
+            f"TOP5 {counts['TOP5']}, TOP10 {counts['TOP10']}, "
+            f"보류 {counts['보류']}, 위험 {counts['위험']} ==="
+        )
         self._render_table()
         self._refresh_summary_bar()
         self.detail_panel.clear()
         self.writing_panel.set_selected(None)
+        self._show_status("분석이 완료되었습니다.")
 
     def _on_analysis_error(self, err):
         self.progress.stop()
