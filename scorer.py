@@ -1,13 +1,7 @@
 # scorer.py
-# v16.8 - 데이터랩 검색어트렌드(spike_ratio) 반영: "뉴스 언급량은 많지만 실제 검색은
-#         평소와 비슷한" 상시성 키워드가 HOT 이슈로 오분류되는 문제를 보완.
-# 변경 사항(2026-07):
-#   1) 기존 v16.7의 모든 로직(광고 경쟁도 배율, 실측 CTR, 글작성순위)은 그대로 유지.
-#   2) score_keyword()에 trend_info(선택)를 추가로 받아, 실제 검색 지수가 평소 대비
-#      SPIKE_RATIO_HOT_THRESHOLD(기본 2.0배) 이상 튀지 않았다면 HOT 이슈 판정을 취소하고
-#      "수익형 정기"로 재분류함.
-#   3) app.py에서 1차 스코어링 후 상위 후보만 데이터랩 API로 재검증할 수 있도록
-#      recheck_with_trend() 공개 함수를 추가함 (내부 _categorize를 외부에서 다시 쓸 수 있게).
+# v16.9 - 이모지(🔥,ℹ,⚠) 표시가 Windows 기본 글꼴에서 깨지는 문제를 해결하기 위해
+#         모든 표시 문구를 일반 텍스트([급증], [평이], [주의] 등)로 교체.
+#         나머지 로직(광고 경쟁도 배율, 글작성순위, 트렌드 재검증)은 v16.8과 완전히 동일.
 
 import math
 
@@ -23,11 +17,8 @@ TRAFFIC_CAPTURE_RATE = {
     "multiword": 0.3,
 }
 
-# API에 실측 CTR이 없을 때만 사용하는 기본 클릭률
 DEFAULT_AD_CLICK_RATE = 0.02
 
-# 카테고리별 "기본" CPC(원) 추정치. 여기에 plAvgDepth 배율을 곱해 실제 단가를 보정한다.
-# ※ 실측 데이터가 아니라 상대적 우선순위를 위한 근사값입니다.
 CATEGORY_CPC_KRW = {
     "보험": 100,
     "대출": 80,
@@ -41,14 +32,11 @@ CATEGORY_CPC_KRW = {
 MONEY_CATEGORY_KEYWORDS = list(CATEGORY_CPC_KRW.keys())
 DEFAULT_CPC_KRW = 15
 
-# plAvgDepth(평균 광고 노출 개수)를 CPC 배율로 변환할 때 사용하는 정규화 기준
 AD_DEPTH_BASELINE = 3.0
 AD_DEPTH_MAX_MULTIPLIER = 4.0
 
 NON_MONEY_PROFIT_CAP = 8.0
 NEW_ISSUE_MENTION_THRESHOLD = 4
-
-# ---------------------- 글작성순위(우선순위) 계산용 매핑/기준 ----------------------
 
 TYPE_CODE_MAP = {
     "HOT 이슈": "HOT_ISSUE",
@@ -73,10 +61,6 @@ HOT_ISSUE_MENTION_SCALE = 20
 RECURRING_PROFIT_WEIGHT = 1.0
 NON_PROFIT_WEIGHT = 0.3
 
-# ---------------------- [NEW] 검색어트렌드 급증 판정 기준 ----------------------
-
-# 최근 검색 지수가 평소(baseline) 대비 이 값 이상 튀어야 "진짜 HOT 이슈"로 인정.
-# 미만이면 뉴스 언급이 많아도 "상시성 키워드"로 보고 수익형 정기로 재분류.
 SPIKE_RATIO_HOT_THRESHOLD = 2.0
 
 
@@ -215,17 +199,17 @@ def _build_reason_checklist(candidate: dict, revenue_info: dict, trend_info: dic
     revenue_text = f"예상 월수익 약 {revenue_info['estimated_revenue_krw']:,.0f}원 (추정, 실제와 다를 수 있음)"
     reasons.append(revenue_text)
 
-    # [NEW] 데이터랩 트렌드 결과를 이유 목록 맨 앞/뒤에 반영
+    # [FIXED] 이모지 대신 일반 텍스트 태그 사용
     if trend_info.get("trend_available"):
         spike = trend_info.get("spike_ratio", 1.0)
         if spike >= SPIKE_RATIO_HOT_THRESHOLD:
-            reasons.insert(0, f"🔥 실제 검색량 급증 확인 (평소 대비 x{spike})")
+            reasons.insert(0, f"[급증 확인] 실제 검색량이 평소 대비 x{spike}배 증가")
         else:
-            reasons.append(f"ℹ 뉴스 언급은 많지만 검색량은 평소와 비슷함 (x{spike}) - 상시성 키워드로 판단")
+            reasons.append(f"[평이] 뉴스 언급은 많지만 검색량은 평소와 비슷함(x{spike}) - 상시성 키워드로 판단")
 
     if revenue_info.get("low_search_high_value"):
         reasons.append(
-            f"⭐ 조회수는 낮지만 광고 경쟁도 높음(배율 x{revenue_info['ad_depth_multiplier']}) "
+            f"[숨은고수익] 조회수는 낮지만 광고 경쟁도 높음(배율 x{revenue_info['ad_depth_multiplier']}) "
             "- 실제 단가가 높아 숨은 고수익 키워드일 가능성"
         )
     if candidate["mentions"] >= 5 and not candidate.get("is_generic"):
@@ -237,9 +221,9 @@ def _build_reason_checklist(candidate: dict, revenue_info: dict, trend_info: dic
     if revenue_info.get("new_issue_special_case"):
         reasons.append("신규 이슈 (검색량 데이터 미반영, 뉴스 언급 기반 추정)")
     if candidate.get("is_generic"):
-        reasons.append("⚠ 범용 레드오션 키워드 - 검색량은 크지만 실제 유입은 매우 제한적")
+        reasons.append("[주의] 범용 레드오션 키워드 - 검색량은 크지만 실제 유입은 매우 제한적")
     if not revenue_info["is_money_category"]:
-        reasons.append("⚠ 수익 카테고리 미매칭 - 애드포스트 수익성 낮을 가능성")
+        reasons.append("[주의] 수익 카테고리 미매칭 - 애드포스트 수익성 낮을 가능성")
     return reasons
 
 
@@ -252,7 +236,6 @@ def _categorize(final_score: float, issue_score: float, profit_score: float,
     is_hot_candidate = issue_score >= 25 and profit_score >= 40 and not is_generic
 
     if is_hot_candidate:
-        # [NEW] 데이터랩 트렌드 정보가 있으면 실제 검색 급증 여부로 한 번 더 검증
         if trend_available and spike_ratio is not None and spike_ratio < SPIKE_RATIO_HOT_THRESHOLD:
             return "수익형 정기"
         return "HOT 이슈"
@@ -290,10 +273,6 @@ def calculate_writing_priority(revenue_krw: float, difficulty_level: int, keywor
 
 
 def score_keyword(candidate: dict, naver_data: dict = None, trend_info: dict = None) -> dict:
-    """
-    trend_info는 선택 인자입니다. 없으면(None) 기존처럼 뉴스 언급량만으로 판단하고,
-    있으면(데이터랩 API 결과) 실제 검색 급증 여부까지 반영해서 더 정확하게 분류합니다.
-    """
     naver_data = naver_data or {}
     trend_info = trend_info or {}
 
@@ -344,21 +323,15 @@ def score_keyword(candidate: dict, naver_data: dict = None, trend_info: dict = N
         "writing_priority_score": priority_info["priority_score"],
         "writing_guidance": priority_info["guidance"],
         "urgency_weight": priority_info["urgency_weight"],
-        # [NEW] 트렌드 재검증 여부/결과를 함께 저장 (화면 표시 및 재계산용)
         "trend_checked": trend_info.get("trend_available", False),
         "spike_ratio": trend_info.get("spike_ratio"),
     }
 
 
 def recheck_with_trend(scored_result: dict, trend_info: dict) -> dict:
-    """
-    [NEW] 이미 score_keyword()로 1차 스코어링이 끝난 결과에 대해,
-    데이터랩 검색어트렌드 결과(trend_info)를 반영해서 유형/우선순위를 다시 계산한다.
-    app.py에서 "상위 후보만 추가로 데이터랩 API 호출 -> 재분류" 하는 2단계 방식에 사용.
-    """
     keyword_type = _categorize(
         scored_result["final_score"], scored_result["issue_score"], scored_result["profit_score"],
-        scored_result["is_money_category"], False,  # is_generic 정보는 최초 스코어링에 이미 반영됨
+        scored_result["is_money_category"], False,
         spike_ratio=trend_info.get("spike_ratio"),
         trend_available=trend_info.get("trend_available", False),
     )
@@ -371,14 +344,14 @@ def recheck_with_trend(scored_result: dict, trend_info: dict) -> dict:
         mentions=scored_result["mentions"],
     )
 
-    # 트렌드 반영 사유 문구를 이유 목록 맨 앞에 추가 (중복 방지)
-    reasons = [r for r in scored_result["reasons"] if "실제 검색량" not in r and "검색량은 평소와" not in r]
+    # [FIXED] 이모지 문자열 대신 텍스트 태그로 중복 검사
+    reasons = [r for r in scored_result["reasons"] if "급증 확인" not in r and "[평이]" not in r]
     if trend_info.get("trend_available"):
         spike = trend_info.get("spike_ratio", 1.0)
         if spike >= SPIKE_RATIO_HOT_THRESHOLD:
-            reasons.insert(0, f"🔥 실제 검색량 급증 확인 (평소 대비 x{spike})")
+            reasons.insert(0, f"[급증 확인] 실제 검색량이 평소 대비 x{spike}배 증가")
         else:
-            reasons.append(f"ℹ 뉴스 언급은 많지만 검색량은 평소와 비슷함 (x{spike}) - 상시성 키워드로 판단")
+            reasons.append(f"[평이] 뉴스 언급은 많지만 검색량은 평소와 비슷함(x{spike}) - 상시성 키워드로 판단")
 
     scored_result["type"] = keyword_type
     scored_result["type_code"] = type_code
