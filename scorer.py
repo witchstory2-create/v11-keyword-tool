@@ -1,16 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v17.1) - Verification + Scoring 단계
+scorer.py (v17.2) - Verification + Scoring 단계
 검색량(검색광고API) / 문서수(검색API) / DataLab 상승률을 실측하여
 IssueScore, OpportunityScore, FinalScore를 계산하고 등급(TOP5/TOP10/보류/위험)을 매긴다.
-API 호출이 실패하면 해당 필드는 '검증 실패'로 명확히 표시하고, 실패 이유를 함께 기록한다.
+
+[등급 정책]
+- 위험(빨강)  : 오직 '범용 상시성 키워드(보험/대출/연금 등)'일 때만 부여.
+- 보류(회색)  : 문서수 과다 또는 DataLab 상승률 미달처럼 '오늘 당장 매력적이지 않은' 경우.
+- TOP5 / TOP10 : 위험/보류가 아니면서 신뢰도(confidence)가 충족되고 순위가 높은 경우.
+
+API 호출이 실패하면 해당 필드는 '검증 실패'로 표시하고 실패 이유를 함께 기록한다.
 """
 
 import math
 
 SPIKE_HARDCUT = 1.3
-RISK_DOC_ABS = 1_000_000
-RISK_DOC_GENERIC = 300_000
+RISK_DOC_GENERIC = 300_000     # 범용 키워드 + 이 이상 문서수 => 위험(경쟁 극심)
+HOLD_DOC_ABS = 1_000_000       # 일반 키워드라도 이 이상 문서수 => 보류(경쟁 심함)
 CPC_DEFAULT = 450
 
 
@@ -102,15 +108,23 @@ def _recommend_tags(r):
 
 
 def _risk_reasons(r):
+    """'쓰면 안 되는' 진짜 위험 요인만 판정. 오직 범용 상시성 키워드일 때만 부여."""
     reasons = []
     if r.get("generic_flag"):
-        reasons.append("범용(상시성) 키워드 포함")
+        doc = r.get("doc_count")
+        if doc is not None and doc > RISK_DOC_GENERIC:
+            reasons.append(f"범용(상시성) 키워드 + 문서수 과다({doc:,}건) - 경쟁 극심")
+        else:
+            reasons.append("범용(상시성) 키워드 - 항상 검색되지만 경쟁도 항상 치열함")
+    return reasons
+
+
+def _hold_reasons(r):
+    """위험은 아니지만 '오늘 당장 쓸 만큼 매력적이지 않은' 이유. TOP5/10에서 우선순위가 밀리는 요인."""
+    reasons = []
     doc = r.get("doc_count")
-    if doc is not None:
-        if r.get("generic_flag") and doc > RISK_DOC_GENERIC:
-            reasons.append(f"범용어+문서수 과다({doc:,}건)")
-        if doc > RISK_DOC_ABS:
-            reasons.append(f"문서수 절대치 과다({doc:,}건)")
+    if doc is not None and doc > HOLD_DOC_ABS:
+        reasons.append(f"문서수 절대치 과다({doc:,}건) - 경쟁 심함")
     if r.get("spike_ratio") is not None and r["spike_ratio"] < SPIKE_HARDCUT:
         reasons.append(f"DataLab 상승률 미달(x{r['spike_ratio']:.2f} < x{SPIKE_HARDCUT})")
     return reasons
@@ -151,7 +165,15 @@ def score_candidates(candidates, search_api=None, datalab_api=None, ads_api=None
             opp_score = 0.0
         v["opportunity_score"] = round(opp_score, 4)
 
-        generic_penalty = 0.4 if v.get("generic_flag") else 1.0
+        # 위험/보류 사유 분리 판정
+        v["risk_reasons"] = _risk_reasons(v)
+        v["hold_reasons"] = _hold_reasons(v)
+        v["recommend_tags"] = _recommend_tags(v)
+        v["estimated_revenue_won"] = estimate_monthly_revenue_won(sv, doc) if (sv and doc is not None) else None
+
+        generic_penalty = 0.4 if v["risk_reasons"] else 1.0
+        hold_penalty = 0.75 if v["hold_reasons"] else 1.0
+
         verified_cnt = sum([
             1 if v["doc_status"] == "검증 완료" else 0,
             1 if v["search_status"] == "검증 완료" else 0,
@@ -161,18 +183,16 @@ def score_candidates(candidates, search_api=None, datalab_api=None, ads_api=None
         v["confidence"] = confidence
 
         final_score = v["issue_score"] * 40 + min(v["opportunity_score"], 500) * 0.1
-        final_score = final_score * generic_penalty * (0.4 + 0.6 * confidence)
+        final_score = final_score * generic_penalty * hold_penalty * (0.4 + 0.6 * confidence)
         v["final_score"] = round(final_score, 2)
-
-        v["risk_reasons"] = _risk_reasons(v)
-        v["recommend_tags"] = _recommend_tags(v)
-        v["estimated_revenue_won"] = estimate_monthly_revenue_won(sv, doc) if (sv and doc is not None) else None
 
     verified.sort(key=lambda x: x["final_score"], reverse=True)
 
     for i, v in enumerate(verified):
         if v["risk_reasons"]:
             v["grade"] = "위험"
+        elif v["hold_reasons"] and v["confidence"] < 0.67:
+            v["grade"] = "보류"
         elif i < 5 and v["confidence"] >= 0.34:
             v["grade"] = "TOP5"
         elif i < 10 and v["confidence"] >= 0.34:
