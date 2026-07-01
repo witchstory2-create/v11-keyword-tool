@@ -23,14 +23,28 @@ def run_analysis():
 
     results = []
 
-    for kw in issue_keywords[:30]:
-        try:
-            data = get_keyword_data(kw, cid, api, secret)
-            for item in data[:5]:
-                scored = score_keyword(item, kw)
-                results.append(scored)
-        except:
+    error_count = 0
+
+for kw in issue_keywords[:50]:
+    try:
+        data = get_keyword_data(kw, cid, api, secret)
+
+        if not data:
             continue
+
+        for item in data[:5]:
+            scored = score_keyword(item, kw)
+            results.append(scored)
+
+    except Exception as e:
+        error_count += 1
+        print("API 오류:", kw, e)
+
+if not results:
+    messagebox.showwarning(
+        "분석 결과 없음",
+        f"분석 결과가 0개입니다.\n후보 키워드 수: {len(issue_keywords)}개\nAPI 오류 수: {error_count}개"
+    )
 
     results.sort(key=lambda x: x["final_score"], reverse=True)
 
