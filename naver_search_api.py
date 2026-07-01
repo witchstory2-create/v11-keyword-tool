@@ -1,13 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-naver_search_api.py (v17.1)
+naver_search_api.py (v18.2)
 ----------------------------------------------------
 네이버 API 3종 래퍼 + 개별 연결 테스트
-1) NaverSearchAPI   : 검색 Open API (블로그/뉴스 문서수)
-2) NaverDataLabAPI  : 데이터랩 검색어트렌드 (상승률)
-3) NaverAdsAPI      : 검색광고 API (검색량/경쟁도)
 
-표준 라이브러리만 사용 (urllib.request) -> requests 불필요, PyInstaller onefile 빌드에 안전.
+[이 파일의 역할]
+1) NaverSearchAPI   : 검색 Open API (블로그/뉴스 문서수 조회) -> scorer.py가 사용
+2) NaverDataLabAPI  : 데이터랩 검색어트렌드 (DataLab 상승률 조회) -> scorer.py가 사용
+3) NaverAdsAPI      : 검색광고 API (검색량/경쟁도 조회) -> scorer.py가 사용
+
+[이 파일이 하지 않는 일]
+- 뉴스 수집, 후보 추출 -> collector.py
+- 수익형 필터링, 카테고리 가중치 -> profit_filter.py
+- 점수 계산, 등급 분류 -> scorer.py
+- 화면 표시 -> app.py
+
+표준 라이브러리만 사용 (urllib.request, hmac, hashlib, base64) -> requests 등 외부 패키지 불필요,
+PyInstaller onefile 빌드에 안전.
 """
 
 import json
@@ -66,6 +75,8 @@ def _diagnose(status, body, kind):
     """HTTP status/body -> 사람이 읽을 수 있는 실패 원인 문자열"""
     if status == 200:
         return "OK"
+    if status in (301, 302, 307, 308):
+        return f"{status} 리다이렉트 - 호출 주소(BASE URL)가 잘못되었습니다."
     if status == 401:
         if kind == "search":
             return "401 인증 실패 - 검색 API Client ID/Secret 값을 확인하세요."
@@ -216,6 +227,8 @@ class NaverDataLabAPI:
 
 # ------------------------------------------------------------------
 # 3) 검색광고 API - 검색량 / 경쟁도
+#    BASE URL은 반드시 api.searchad.naver.com 이어야 한다.
+#    (api.naver.com으로 호출하면 308 Permanent Redirect가 발생함)
 # ------------------------------------------------------------------
 class NaverAdsAPI:
     BASE = "https://api.searchad.naver.com"
