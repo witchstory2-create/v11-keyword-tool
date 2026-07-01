@@ -1,5 +1,5 @@
 # scorer.py
-# v16.6 - 실제 광고 경쟁도(plAvgDepth) 및 실측 CTR 기반 수익 추정
+# v16.7 - 실제 광고 경쟁도(plAvgDepth) 및 실측 CTR 기반 수익 추정 + 글작성순위(우선순위) 계산
 # 변경 사항(2026-07):
 #   1) 카테고리 고정 CPC 대신, 네이버 API가 무료로 제공하는 plAvgDepth(평균 광고 노출 개수)를
 #      배율로 사용해 "검색량은 적어도 광고주 경쟁이 치열한 키워드"의 실제 CPC를 더 높게 추정
@@ -7,6 +7,10 @@
 #   2) 임의로 고정했던 2% 클릭률 대신, API가 돌려주는 실측 CTR(monthlyAvePcCtr/MobileCtr)을
 #      우선 사용하고, 값이 없을 때만 2%를 기본값으로 사용
 #   3) 추천 이유에 "조회수는 낮지만 광고 경쟁 치열 -> 실제 단가 높을 가능성" 문구 추가
+#   4) [NEW] "글작성순위" 개념 추가: 단순 최종점수가 아니라
+#      (예상수익 / 난이도지수) x 시급성가중치 로 "지금 뭘 먼저 써야 수익이 나는지"를 계산.
+#      HOT 이슈(실시간성 높은 키워드)는 시급성가중치를 높여 "오늘 작성 권장"으로 표시하고,
+#      수익형 정기 키워드는 시급성가중치를 1.0으로 고정해 "여유있게 작성 가능"으로 표시함.
 
 import math
 
@@ -47,6 +51,35 @@ AD_DEPTH_MAX_MULTIPLIER = 4.0
 
 NON_MONEY_PROFIT_CAP = 8.0
 NEW_ISSUE_MENTION_THRESHOLD = 4
+
+# ---------------------- [NEW] 글작성순위(우선순위) 계산용 매핑/기준 ----------------------
+
+# _categorize()가 반환하는 한글 유형 문자열 -> 우선순위 계산용 코드값
+TYPE_CODE_MAP = {
+    "HOT 이슈": "HOT_ISSUE",
+    "수익형 정기": "RECURRING_PROFIT",
+    "비수익(제외권장)": "NON_PROFIT",
+    "보류": "RECURRING_PROFIT",
+    "주의": "RECURRING_PROFIT",
+}
+
+# get_difficulty()가 반환하는 한글 난이도 문자열 -> 숫자 레벨(1=쉬움 ~ 3=어려움)
+DIFFICULTY_LEVEL_MAP = {
+    "쉬움": 1,
+    "보통": 2,
+    "어려움": 3,
+}
+
+# 난이도 레벨 -> 난이도지수(어려울수록 나눠서 순위가 뒤로 밀림)
+DIFFICULTY_INDEX_MAP = {1: 1.0, 2: 1.8, 3: 2.8}
+
+# HOT 이슈 시급성가중치 범위 (뉴스 언급량이 많을수록 지금 뜨는 이슈일 가능성이 높아 가중치 상향)
+HOT_ISSUE_BASE_WEIGHT = 2.0
+HOT_ISSUE_MAX_WEIGHT = 3.0
+HOT_ISSUE_MENTION_SCALE = 20  # mentions가 이 값에 도달하면 최대 가중치
+
+RECURRING_PROFIT_WEIGHT = 1.0  # 정기 수익형은 시급성 영향 없음(순서 고정 X)
+NON_PROFIT_WEIGHT = 0.3  # 비수익은 순위에서 자동으로 뒤로 밀림
 
 
 def _detect_category(keyword: str) -> str:
@@ -223,6 +256,42 @@ def _categorize(final_score: float, issue_score: float, profit_score: float,
     return "주의"
 
 
+def calculate_writing_priority(revenue_krw: float, difficulty_level: int, keyword_type_code: str, mentions: int = 0) -> dict:
+    """
+    [NEW] "지금 뭘 먼저 써야 수익이 나는지"를 계산하는 함수.
+
+    priority_score = (예상수익 / 난이도지수) x 시급성가중치
+
+    - HOT_ISSUE: 실시간 이슈. 신선도가 빨리 죽으므로 시급성가중치를 2.0~3.0으로 높게 줘서
+      같은 예상수익이라도 자동으로 앞순위로 밀려 올라오게 함.
+    - RECURRING_PROFIT: 자동차보험/대출/연금처럼 언제 써도 검색량이 비슷한 키워드.
+      시급성가중치를 1.0으로 고정해서 순서에 크게 얽매이지 않고 완성도를 높여서 써도 되게 함.
+    - NON_PROFIT: 애드포스트 수익화가 어려운 키워드. 가중치를 낮춰 순위에서 자동으로 뒤로 밀림.
+    """
+    difficulty_index = DIFFICULTY_INDEX_MAP.get(difficulty_level, 2.0)
+
+    if keyword_type_code == "HOT_ISSUE":
+        urgency_weight = HOT_ISSUE_BASE_WEIGHT + min(mentions / HOT_ISSUE_MENTION_SCALE, 1.0)
+        urgency_weight = min(urgency_weight, HOT_ISSUE_MAX_WEIGHT)
+        guidance = "오늘 작성 권장 (실시간 이슈, 신선도 감쇠 빠름)"
+    elif keyword_type_code == "RECURRING_PROFIT":
+        urgency_weight = RECURRING_PROFIT_WEIGHT
+        difficulty_text = {1: "하", 2: "중", 3: "상"}.get(difficulty_level, "중")
+        guidance = f"여유있게 작성 가능 (수익형 정기, 난이도 {difficulty_text})"
+    else:  # NON_PROFIT
+        urgency_weight = NON_PROFIT_WEIGHT
+        guidance = "작성 비권장 (수익화 어려움)"
+
+    priority_score = (revenue_krw / difficulty_index) * urgency_weight
+
+    return {
+        "priority_score": round(priority_score, 1),
+        "guidance": guidance,
+        "difficulty_index": difficulty_index,
+        "urgency_weight": round(urgency_weight, 2),
+    }
+
+
 def score_keyword(candidate: dict, naver_data: dict = None) -> dict:
     naver_data = naver_data or {}
 
@@ -237,6 +306,16 @@ def score_keyword(candidate: dict, naver_data: dict = None) -> dict:
     )
     reasons = _build_reason_checklist(candidate, revenue_info)
 
+    # [NEW] 글작성순위(우선순위) 계산
+    type_code = TYPE_CODE_MAP.get(keyword_type, "RECURRING_PROFIT")
+    difficulty_level = DIFFICULTY_LEVEL_MAP.get(difficulty, 2)
+    priority_info = calculate_writing_priority(
+        revenue_krw=revenue_info["estimated_revenue_krw"],
+        difficulty_level=difficulty_level,
+        keyword_type_code=type_code,
+        mentions=candidate["mentions"],
+    )
+
     return {
         "keyword": candidate["keyword"],
         "mentions": candidate["mentions"],
@@ -247,7 +326,9 @@ def score_keyword(candidate: dict, naver_data: dict = None) -> dict:
         "profit_score": profit_score,
         "final_score": final_score,
         "type": keyword_type,
+        "type_code": type_code,
         "difficulty": difficulty,
+        "difficulty_level": difficulty_level,
         "money_category": revenue_info["category"],
         "is_money_category": revenue_info["is_money_category"],
         "estimated_revenue_krw": revenue_info["estimated_revenue_krw"],
@@ -256,10 +337,16 @@ def score_keyword(candidate: dict, naver_data: dict = None) -> dict:
         "low_search_high_value": revenue_info["low_search_high_value"],
         "new_issue_special_case": revenue_info["new_issue_special_case"],
         "reasons": reasons,
+        # [NEW] 글작성순위 관련 필드
+        "writing_priority_score": priority_info["priority_score"],
+        "writing_guidance": priority_info["guidance"],
+        "urgency_weight": priority_info["urgency_weight"],
     }
 
 
 def filter_top5(scored_keywords: list) -> list:
     money_only = [k for k in scored_keywords if k["is_money_category"]]
-    money_only.sort(key=lambda x: x["final_score"], reverse=True)
+    # [CHANGED] final_score 대신 writing_priority_score(글작성순위) 기준으로 정렬
+    # -> "지금 뭘 먼저 써야 수익이 나는지"가 TOP5 순서에 그대로 반영됨
+    money_only.sort(key=lambda x: x["writing_priority_score"], reverse=True)
     return money_only[:5]
