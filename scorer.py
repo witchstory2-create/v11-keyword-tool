@@ -1,16 +1,13 @@
 # scorer.py
-# v16.7 - 실제 광고 경쟁도(plAvgDepth) 및 실측 CTR 기반 수익 추정 + 글작성순위(우선순위) 계산
+# v16.8 - 데이터랩 검색어트렌드(spike_ratio) 반영: "뉴스 언급량은 많지만 실제 검색은
+#         평소와 비슷한" 상시성 키워드가 HOT 이슈로 오분류되는 문제를 보완.
 # 변경 사항(2026-07):
-#   1) 카테고리 고정 CPC 대신, 네이버 API가 무료로 제공하는 plAvgDepth(평균 광고 노출 개수)를
-#      배율로 사용해 "검색량은 적어도 광고주 경쟁이 치열한 키워드"의 실제 CPC를 더 높게 추정
-#      -> 조회수가 낮아도 수익이 높게 나올 수 있는 현상을 반영
-#   2) 임의로 고정했던 2% 클릭률 대신, API가 돌려주는 실측 CTR(monthlyAvePcCtr/MobileCtr)을
-#      우선 사용하고, 값이 없을 때만 2%를 기본값으로 사용
-#   3) 추천 이유에 "조회수는 낮지만 광고 경쟁 치열 -> 실제 단가 높을 가능성" 문구 추가
-#   4) [NEW] "글작성순위" 개념 추가: 단순 최종점수가 아니라
-#      (예상수익 / 난이도지수) x 시급성가중치 로 "지금 뭘 먼저 써야 수익이 나는지"를 계산.
-#      HOT 이슈(실시간성 높은 키워드)는 시급성가중치를 높여 "오늘 작성 권장"으로 표시하고,
-#      수익형 정기 키워드는 시급성가중치를 1.0으로 고정해 "여유있게 작성 가능"으로 표시함.
+#   1) 기존 v16.7의 모든 로직(광고 경쟁도 배율, 실측 CTR, 글작성순위)은 그대로 유지.
+#   2) score_keyword()에 trend_info(선택)를 추가로 받아, 실제 검색 지수가 평소 대비
+#      SPIKE_RATIO_HOT_THRESHOLD(기본 2.0배) 이상 튀지 않았다면 HOT 이슈 판정을 취소하고
+#      "수익형 정기"로 재분류함.
+#   3) app.py에서 1차 스코어링 후 상위 후보만 데이터랩 API로 재검증할 수 있도록
+#      recheck_with_trend() 공개 함수를 추가함 (내부 _categorize를 외부에서 다시 쓸 수 있게).
 
 import math
 
@@ -45,16 +42,14 @@ MONEY_CATEGORY_KEYWORDS = list(CATEGORY_CPC_KRW.keys())
 DEFAULT_CPC_KRW = 15
 
 # plAvgDepth(평균 광고 노출 개수)를 CPC 배율로 변환할 때 사용하는 정규화 기준
-# depth가 이 값과 같으면 배율 1.0, 이보다 크면 배율이 커지고 최대 AD_DEPTH_MAX_MULTIPLIER로 캡
 AD_DEPTH_BASELINE = 3.0
 AD_DEPTH_MAX_MULTIPLIER = 4.0
 
 NON_MONEY_PROFIT_CAP = 8.0
 NEW_ISSUE_MENTION_THRESHOLD = 4
 
-# ---------------------- [NEW] 글작성순위(우선순위) 계산용 매핑/기준 ----------------------
+# ---------------------- 글작성순위(우선순위) 계산용 매핑/기준 ----------------------
 
-# _categorize()가 반환하는 한글 유형 문자열 -> 우선순위 계산용 코드값
 TYPE_CODE_MAP = {
     "HOT 이슈": "HOT_ISSUE",
     "수익형 정기": "RECURRING_PROFIT",
@@ -63,23 +58,26 @@ TYPE_CODE_MAP = {
     "주의": "RECURRING_PROFIT",
 }
 
-# get_difficulty()가 반환하는 한글 난이도 문자열 -> 숫자 레벨(1=쉬움 ~ 3=어려움)
 DIFFICULTY_LEVEL_MAP = {
     "쉬움": 1,
     "보통": 2,
     "어려움": 3,
 }
 
-# 난이도 레벨 -> 난이도지수(어려울수록 나눠서 순위가 뒤로 밀림)
 DIFFICULTY_INDEX_MAP = {1: 1.0, 2: 1.8, 3: 2.8}
 
-# HOT 이슈 시급성가중치 범위 (뉴스 언급량이 많을수록 지금 뜨는 이슈일 가능성이 높아 가중치 상향)
 HOT_ISSUE_BASE_WEIGHT = 2.0
 HOT_ISSUE_MAX_WEIGHT = 3.0
-HOT_ISSUE_MENTION_SCALE = 20  # mentions가 이 값에 도달하면 최대 가중치
+HOT_ISSUE_MENTION_SCALE = 20
 
-RECURRING_PROFIT_WEIGHT = 1.0  # 정기 수익형은 시급성 영향 없음(순서 고정 X)
-NON_PROFIT_WEIGHT = 0.3  # 비수익은 순위에서 자동으로 뒤로 밀림
+RECURRING_PROFIT_WEIGHT = 1.0
+NON_PROFIT_WEIGHT = 0.3
+
+# ---------------------- [NEW] 검색어트렌드 급증 판정 기준 ----------------------
+
+# 최근 검색 지수가 평소(baseline) 대비 이 값 이상 튀어야 "진짜 HOT 이슈"로 인정.
+# 미만이면 뉴스 언급이 많아도 "상시성 키워드"로 보고 수익형 정기로 재분류.
+SPIKE_RATIO_HOT_THRESHOLD = 2.0
 
 
 def _detect_category(keyword: str) -> str:
@@ -118,18 +116,12 @@ def _calculate_issue_score(candidate: dict, naver_data: dict) -> float:
 
 
 def _get_ad_depth_multiplier(naver_data: dict) -> float:
-    """
-    plAvgDepth(평균 파워링크 광고 노출 개수)가 높을수록 광고주 경쟁이 치열하다는 뜻이고,
-    이는 실제 CPC가 카테고리 평균보다 훨씬 높을 가능성을 의미한다.
-    검색량이 적어도 이 값이 높으면 수익 추정치를 끌어올려 준다.
-    """
     depth = float(naver_data.get("plAvgDepth", 0) or 0)
     multiplier = 1.0 + (depth / AD_DEPTH_BASELINE)
     return min(multiplier, AD_DEPTH_MAX_MULTIPLIER)
 
 
 def _get_effective_click_rate(naver_data: dict) -> float:
-    """API가 돌려준 실측 CTR을 우선 사용하고, 없으면 기본값(2%)을 사용"""
     ctr_pc = float(naver_data.get("monthlyAvePcCtr", 0) or 0)
     ctr_mobile = float(naver_data.get("monthlyAveMobileCtr", 0) or 0)
     ctr_values = [c for c in (ctr_pc, ctr_mobile) if c > 0]
@@ -162,7 +154,6 @@ def estimate_monthly_revenue(candidate: dict, naver_data: dict) -> dict:
     if total_search > 0:
         effective_demand = total_search ** alpha
         estimated_visits = effective_demand * capture_rate
-        # 검색량은 적은데(1000 미만) 광고 경쟁도가 높으면 "숨은 고수익 키워드" 신호로 표시
         if total_search < 1000 and ad_depth_multiplier >= 1.8:
             low_search_high_value = True
     else:
@@ -185,7 +176,7 @@ def estimate_monthly_revenue(candidate: dict, naver_data: dict) -> dict:
         "estimated_visits": round(estimated_visits, 1),
         "estimated_revenue_krw": round(estimated_revenue_krw, 1),
         "ad_depth_multiplier": round(ad_depth_multiplier, 2),
-        "click_rate_used": round(click_rate * 100, 2),  # %로 표시
+        "click_rate_used": round(click_rate * 100, 2),
         "new_issue_special_case": new_issue_special_case,
         "low_search_high_value": low_search_high_value,
         "tier": tier,
@@ -218,10 +209,19 @@ def get_difficulty(candidate: dict, naver_data: dict) -> str:
     return "보통"
 
 
-def _build_reason_checklist(candidate: dict, revenue_info: dict) -> list:
+def _build_reason_checklist(candidate: dict, revenue_info: dict, trend_info: dict = None) -> list:
+    trend_info = trend_info or {}
     reasons = []
     revenue_text = f"예상 월수익 약 {revenue_info['estimated_revenue_krw']:,.0f}원 (추정, 실제와 다를 수 있음)"
     reasons.append(revenue_text)
+
+    # [NEW] 데이터랩 트렌드 결과를 이유 목록 맨 앞/뒤에 반영
+    if trend_info.get("trend_available"):
+        spike = trend_info.get("spike_ratio", 1.0)
+        if spike >= SPIKE_RATIO_HOT_THRESHOLD:
+            reasons.insert(0, f"🔥 실제 검색량 급증 확인 (평소 대비 x{spike})")
+        else:
+            reasons.append(f"ℹ 뉴스 언급은 많지만 검색량은 평소와 비슷함 (x{spike}) - 상시성 키워드로 판단")
 
     if revenue_info.get("low_search_high_value"):
         reasons.append(
@@ -244,11 +244,19 @@ def _build_reason_checklist(candidate: dict, revenue_info: dict) -> list:
 
 
 def _categorize(final_score: float, issue_score: float, profit_score: float,
-                 is_money_category: bool, is_generic: bool) -> str:
+                 is_money_category: bool, is_generic: bool,
+                 spike_ratio: float = None, trend_available: bool = False) -> str:
     if not is_money_category:
         return "비수익(제외권장)"
-    if issue_score >= 25 and profit_score >= 40 and not is_generic:
+
+    is_hot_candidate = issue_score >= 25 and profit_score >= 40 and not is_generic
+
+    if is_hot_candidate:
+        # [NEW] 데이터랩 트렌드 정보가 있으면 실제 검색 급증 여부로 한 번 더 검증
+        if trend_available and spike_ratio is not None and spike_ratio < SPIKE_RATIO_HOT_THRESHOLD:
+            return "수익형 정기"
         return "HOT 이슈"
+
     if profit_score >= 45:
         return "수익형 정기"
     if final_score < 8:
@@ -257,17 +265,6 @@ def _categorize(final_score: float, issue_score: float, profit_score: float,
 
 
 def calculate_writing_priority(revenue_krw: float, difficulty_level: int, keyword_type_code: str, mentions: int = 0) -> dict:
-    """
-    [NEW] "지금 뭘 먼저 써야 수익이 나는지"를 계산하는 함수.
-
-    priority_score = (예상수익 / 난이도지수) x 시급성가중치
-
-    - HOT_ISSUE: 실시간 이슈. 신선도가 빨리 죽으므로 시급성가중치를 2.0~3.0으로 높게 줘서
-      같은 예상수익이라도 자동으로 앞순위로 밀려 올라오게 함.
-    - RECURRING_PROFIT: 자동차보험/대출/연금처럼 언제 써도 검색량이 비슷한 키워드.
-      시급성가중치를 1.0으로 고정해서 순서에 크게 얽매이지 않고 완성도를 높여서 써도 되게 함.
-    - NON_PROFIT: 애드포스트 수익화가 어려운 키워드. 가중치를 낮춰 순위에서 자동으로 뒤로 밀림.
-    """
     difficulty_index = DIFFICULTY_INDEX_MAP.get(difficulty_level, 2.0)
 
     if keyword_type_code == "HOT_ISSUE":
@@ -292,21 +289,28 @@ def calculate_writing_priority(revenue_krw: float, difficulty_level: int, keywor
     }
 
 
-def score_keyword(candidate: dict, naver_data: dict = None) -> dict:
+def score_keyword(candidate: dict, naver_data: dict = None, trend_info: dict = None) -> dict:
+    """
+    trend_info는 선택 인자입니다. 없으면(None) 기존처럼 뉴스 언급량만으로 판단하고,
+    있으면(데이터랩 API 결과) 실제 검색 급증 여부까지 반영해서 더 정확하게 분류합니다.
+    """
     naver_data = naver_data or {}
+    trend_info = trend_info or {}
 
     issue_score = _calculate_issue_score(candidate, naver_data)
     revenue_info = estimate_monthly_revenue(candidate, naver_data)
     profit_score = _calculate_profit_score(revenue_info)
     final_score = _calculate_final_score(issue_score, profit_score, revenue_info["is_money_category"])
     difficulty = get_difficulty(candidate, naver_data)
+
     keyword_type = _categorize(
         final_score, issue_score, profit_score,
-        revenue_info["is_money_category"], candidate.get("is_generic", False)
+        revenue_info["is_money_category"], candidate.get("is_generic", False),
+        spike_ratio=trend_info.get("spike_ratio"),
+        trend_available=trend_info.get("trend_available", False),
     )
-    reasons = _build_reason_checklist(candidate, revenue_info)
+    reasons = _build_reason_checklist(candidate, revenue_info, trend_info)
 
-    # [NEW] 글작성순위(우선순위) 계산
     type_code = TYPE_CODE_MAP.get(keyword_type, "RECURRING_PROFIT")
     difficulty_level = DIFFICULTY_LEVEL_MAP.get(difficulty, 2)
     priority_info = calculate_writing_priority(
@@ -337,16 +341,58 @@ def score_keyword(candidate: dict, naver_data: dict = None) -> dict:
         "low_search_high_value": revenue_info["low_search_high_value"],
         "new_issue_special_case": revenue_info["new_issue_special_case"],
         "reasons": reasons,
-        # [NEW] 글작성순위 관련 필드
         "writing_priority_score": priority_info["priority_score"],
         "writing_guidance": priority_info["guidance"],
         "urgency_weight": priority_info["urgency_weight"],
+        # [NEW] 트렌드 재검증 여부/결과를 함께 저장 (화면 표시 및 재계산용)
+        "trend_checked": trend_info.get("trend_available", False),
+        "spike_ratio": trend_info.get("spike_ratio"),
     }
+
+
+def recheck_with_trend(scored_result: dict, trend_info: dict) -> dict:
+    """
+    [NEW] 이미 score_keyword()로 1차 스코어링이 끝난 결과에 대해,
+    데이터랩 검색어트렌드 결과(trend_info)를 반영해서 유형/우선순위를 다시 계산한다.
+    app.py에서 "상위 후보만 추가로 데이터랩 API 호출 -> 재분류" 하는 2단계 방식에 사용.
+    """
+    keyword_type = _categorize(
+        scored_result["final_score"], scored_result["issue_score"], scored_result["profit_score"],
+        scored_result["is_money_category"], False,  # is_generic 정보는 최초 스코어링에 이미 반영됨
+        spike_ratio=trend_info.get("spike_ratio"),
+        trend_available=trend_info.get("trend_available", False),
+    )
+
+    type_code = TYPE_CODE_MAP.get(keyword_type, "RECURRING_PROFIT")
+    priority_info = calculate_writing_priority(
+        revenue_krw=scored_result["estimated_revenue_krw"],
+        difficulty_level=scored_result["difficulty_level"],
+        keyword_type_code=type_code,
+        mentions=scored_result["mentions"],
+    )
+
+    # 트렌드 반영 사유 문구를 이유 목록 맨 앞에 추가 (중복 방지)
+    reasons = [r for r in scored_result["reasons"] if "실제 검색량" not in r and "검색량은 평소와" not in r]
+    if trend_info.get("trend_available"):
+        spike = trend_info.get("spike_ratio", 1.0)
+        if spike >= SPIKE_RATIO_HOT_THRESHOLD:
+            reasons.insert(0, f"🔥 실제 검색량 급증 확인 (평소 대비 x{spike})")
+        else:
+            reasons.append(f"ℹ 뉴스 언급은 많지만 검색량은 평소와 비슷함 (x{spike}) - 상시성 키워드로 판단")
+
+    scored_result["type"] = keyword_type
+    scored_result["type_code"] = type_code
+    scored_result["writing_priority_score"] = priority_info["priority_score"]
+    scored_result["writing_guidance"] = priority_info["guidance"]
+    scored_result["urgency_weight"] = priority_info["urgency_weight"]
+    scored_result["reasons"] = reasons
+    scored_result["trend_checked"] = trend_info.get("trend_available", False)
+    scored_result["spike_ratio"] = trend_info.get("spike_ratio")
+
+    return scored_result
 
 
 def filter_top5(scored_keywords: list) -> list:
     money_only = [k for k in scored_keywords if k["is_money_category"]]
-    # [CHANGED] final_score 대신 writing_priority_score(글작성순위) 기준으로 정렬
-    # -> "지금 뭘 먼저 써야 수익이 나는지"가 TOP5 순서에 그대로 반영됨
     money_only.sort(key=lambda x: x["writing_priority_score"], reverse=True)
     return money_only[:5]
