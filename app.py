@@ -1,5 +1,11 @@
 # app.py
-# v16.6 - 이슈 수익형 블로그 글 추천기 (광고 경쟁도 배율 / 실질 수익 추정 반영)
+# v16.7 - 이슈 수익형 블로그 글 추천기 (광고 경쟁도 배율 / 실질 수익 추정 + 글작성순위 반영)
+# 변경 사항(2026-07):
+#   - 좌측 표 맨 앞에 "작성순위" 컬럼 추가: 전체 분석 결과를 writing_priority_score 기준으로
+#     재정렬해서 "지금 뭘 먼저 써야 하는지"를 숫자로 바로 보여줌.
+#   - TOP5 작성 큐 헤더에 기존 "★★★ 어려움" 대신 "글작성순위 N위 · 안내문구"를 함께 표시.
+#   - 상세보기 패널에도 동일한 안내문구를 표시해서, 화면에 뜬 제목을 그대로 넘기기 전에
+#     "오늘 써야 하는지 / 여유있게 써도 되는지"를 바로 판단할 수 있게 함.
 
 import csv
 import threading
@@ -18,6 +24,7 @@ from config_manager import save_config, load_config
 
 analysis_results = []
 queue_items = []
+keyword_lookup = {}  # [NEW] 키워드 -> 전체 분석 데이터(우선순위/안내문구 포함) 빠른 조회용
 
 
 # ---------------------- 설정 저장/불러오기 ----------------------
@@ -107,8 +114,6 @@ def run_analysis():
         root.after(0, lambda: analyze_button.config(state="normal"))
         return
 
-    results.sort(key=lambda x: x["final_score"], reverse=True)
-
     seen = set()
     unique_results = []
     for r in results:
@@ -119,16 +124,29 @@ def run_analysis():
     analysis_results = unique_results
 
     def finalize():
+        global keyword_lookup
+
         tree.delete(*tree.get_children())
-        for r in unique_results[:150]:
+
+        # [NEW] "지금 뭘 먼저 써야 하는지" 기준으로 재정렬해서 작성순위를 매김
+        priority_sorted = sorted(unique_results, key=lambda x: x["writing_priority_score"], reverse=True)
+
+        keyword_lookup = {}
+        for rank, r in enumerate(priority_sorted, 1):
+            r["priority_rank"] = rank  # 원본 dict에 순위 저장 (CSV/큐/상세보기에서 재사용)
+            keyword_lookup[r["keyword"]] = r
+
             depth_display = f"x{r['ad_depth_multiplier']}" + (" ⭐" if r.get("low_search_high_value") else "")
+            priority_display = f"{rank}위"
             tree.insert("", "end", values=(
-                r["keyword"], r["pc"], r["mobile"], r["competition"], depth_display,
+                priority_display, r["keyword"], r["pc"], r["mobile"], r["competition"], depth_display,
                 r["issue_score"], r["profit_score"], f"{r['estimated_revenue_krw']:,.0f}",
                 r["final_score"], r["type"], r["difficulty"]
             ))
-        status.config(text=f"완료: {len(unique_results)}개 분석 / API 오류 {error_count}개")
-        # 비수익 카테고리는 제외하고 진짜 애드포스트 수익형 TOP5만 큐에 반영
+
+        status.config(text=f"완료: {len(unique_results)}개 분석 / API 오류 {error_count}개 "
+                            f"(1위=지금 가장 먼저 써야 할 키워드)")
+        # 비수익 카테고리는 제외하고, 글작성순위(writing_priority_score) 기준 진짜 TOP5만 큐에 반영
         build_queue(filter_top5(unique_results))
         analyze_button.config(state="normal")
 
@@ -144,19 +162,37 @@ def show_titles():
         return
 
     values = tree.item(selected[0], "values")
-    keyword = values[0]
-    # 컬럼 순서: keyword(0) pc(1) mobile(2) competition(3) addepth(4)
-    #            issue(5) profit(6) revenue(7) final(8) type(9) difficulty(10)
-    difficulty = values[10] if len(values) > 10 else "보통"
-    render_keyword_detail(keyword, difficulty)
+    # 컬럼 순서: priority(0) keyword(1) pc(2) mobile(3) competition(4) addepth(5)
+    #            issue(6) profit(7) revenue(8) final(9) type(10) difficulty(11)
+    keyword = values[1]
+    difficulty = values[11] if len(values) > 11 else "보통"
+
+    # [NEW] keyword_lookup에서 전체 데이터(작성순위/안내문구 포함)를 가져와서 상세보기에 반영
+    full_data = keyword_lookup.get(keyword, {})
+    render_keyword_detail(keyword, difficulty, full_data)
 
 
-def render_keyword_detail(keyword, difficulty="보통"):
+def render_keyword_detail(keyword, difficulty="보통", full_data=None):
+    full_data = full_data or {}
     search_titles, home_titles = make_titles(keyword)
     outline = generate_outline(keyword)
 
+    priority_rank = full_data.get("priority_rank")
+    guidance = full_data.get("writing_guidance", "")
+    revenue = full_data.get("estimated_revenue_krw")
+
     detail_box.delete("1.0", tk.END)
-    detail_box.insert(tk.END, f"키워드: {keyword} (난이도: {difficulty})\n\n")
+    detail_box.insert(tk.END, f"키워드: {keyword} (난이도: {difficulty})\n")
+
+    if priority_rank:
+        detail_box.insert(
+            tk.END,
+            f"▶ 글작성순위 {priority_rank}위 · {guidance}\n"
+        )
+    if revenue is not None:
+        detail_box.insert(tk.END, f"▶ 예상 월수익(추정): 약 {revenue:,.0f}원\n")
+    detail_box.insert(tk.END, "\n")
+
     detail_box.insert(tk.END, "[검색용 제목 3개]\n")
     for i, t in enumerate(search_titles, 1):
         detail_box.insert(tk.END, f"{i}. {t}\n")
@@ -197,6 +233,9 @@ def build_queue(top5):
             "low_search_high_value": item["low_search_high_value"],
             "reason": item["reasons"],
             "status": "미작성",
+            # [NEW] 글작성순위/안내문구 큐에도 함께 저장
+            "writing_guidance": item.get("writing_guidance", ""),
+            "type_code": item.get("type_code", "RECURRING_PROFIT"),
         })
     save_queue(queue_items)
     render_queue()
@@ -214,14 +253,21 @@ def render_queue():
         row = tk.Frame(queue_inner, relief="groove", borderwidth=1)
         row.pack(fill="x", pady=4, padx=4)
 
-        star = "★" * max(1, min(5, int(q["final_score"] // 20)))
         status_icon = {"미작성": "☐", "작성완료": "☑", "발행완료": "✅"}.get(q["status"], "☐")
         hidden_gem = " ⭐숨은고수익" if q.get("low_search_high_value") else ""
-        header = (f"{q['rank']}위  {q['keyword']}   {star}   난이도: {q['difficulty']}   "
+        header = (f"{q['rank']}위  {q['keyword']}   난이도: {q['difficulty']}   "
                    f"예상수익: {q['estimated_revenue_krw']:,.0f}원{hidden_gem}   "
                    f"{status_icon} {q['status']}")
         tk.Label(row, text=header, font=("맑은 고딕", 11, "bold"), anchor="w",
                  wraplength=560, justify="left").pack(fill="x", padx=6, pady=2)
+
+        # [NEW] "글작성순위 N위 · 오늘 작성 권장 (...)" 형태의 안내문구를 눈에 띄게 표시
+        guidance_text = q.get("writing_guidance", "")
+        if guidance_text:
+            color = "#d35400" if q.get("type_code") == "HOT_ISSUE" else "#2c3e50"
+            tk.Label(row, text=f"▶ 글작성순위 {q['rank']}위 · {guidance_text}",
+                     font=("맑은 고딕", 10, "bold"), fg=color, anchor="w",
+                     wraplength=560, justify="left").pack(fill="x", padx=6, pady=(0, 2))
 
         reason_text = "   ".join(f"✔ {r}" for r in q["reason"])
         tk.Label(row, text=reason_text, fg="gray20", anchor="w",
@@ -229,7 +275,9 @@ def render_queue():
 
         btns = tk.Frame(row)
         btns.pack(fill="x", pady=3)
-        tk.Button(btns, text="작성 시작", command=lambda q=q: render_keyword_detail(q["keyword"], q["difficulty"])).pack(side="left", padx=4)
+        tk.Button(btns, text="작성 시작", command=lambda q=q: render_keyword_detail(
+            q["keyword"], q["difficulty"], keyword_lookup.get(q["keyword"], {})
+        )).pack(side="left", padx=4)
         tk.Button(btns, text="작성완료 표시", command=lambda q=q: mark_status(q, "작성완료")).pack(side="left", padx=4)
         tk.Button(btns, text="발행완료 표시", command=lambda q=q: mark_status(q, "발행완료")).pack(side="left", padx=4)
 
@@ -266,17 +314,22 @@ def save_as_csv():
     path = filedialog.asksaveasfilename(defaultextension=".csv", filetypes=[("CSV", "*.csv")])
     if not path:
         return
+
+    # [NEW] 작성순위 기준으로 정렬해서 저장 (분석 표와 동일한 순서)
+    ordered = sorted(analysis_results, key=lambda x: x.get("priority_rank", 999))
+
     with open(path, "w", newline="", encoding="utf-8-sig") as f:
         writer = csv.writer(f)
-        writer.writerow(["키워드", "PC", "모바일", "경쟁도", "광고배율", "이슈점수", "수익점수",
-                          "예상수익(원)", "최종점수", "유형", "난이도", "숨은고수익여부"])
-        for r in analysis_results:
-            writer.writerow([r["keyword"], r["pc"], r["mobile"], r["competition"],
+        writer.writerow(["작성순위", "키워드", "PC", "모바일", "경쟁도", "광고배율", "이슈점수", "수익점수",
+                          "예상수익(원)", "최종점수", "유형", "난이도", "숨은고수익여부", "작성가이드"])
+        for r in ordered:
+            writer.writerow([r.get("priority_rank", ""), r["keyword"], r["pc"], r["mobile"], r["competition"],
                               f"x{r['ad_depth_multiplier']}",
                               r["issue_score"], r["profit_score"],
                               f"{r['estimated_revenue_krw']:,.0f}",
                               r["final_score"], r["type"], r["difficulty"],
-                              "예" if r.get("low_search_high_value") else ""])
+                              "예" if r.get("low_search_high_value") else "",
+                              r.get("writing_guidance", "")])
     status.config(text=f"CSV 저장 완료: {path}")
 
 
@@ -341,19 +394,21 @@ main_pane.pack(fill="both", expand=True, padx=15, pady=8)
 left_frame = tk.Frame(main_pane)
 main_pane.add(left_frame, weight=3)
 
-columns = ("keyword", "pc", "mobile", "competition", "addepth",
+# [CHANGED] "priority" 컬럼을 맨 앞에 추가
+columns = ("priority", "keyword", "pc", "mobile", "competition", "addepth",
            "issue", "profit", "revenue", "final", "type", "difficulty")
 tree = ttk.Treeview(left_frame, columns=columns, show="headings", height=25)
 
 headers = {
-    "keyword": "키워드", "pc": "PC", "mobile": "모바일", "competition": "경쟁도",
+    "priority": "작성순위", "keyword": "키워드", "pc": "PC", "mobile": "모바일", "competition": "경쟁도",
     "addepth": "광고배율", "issue": "이슈점수", "profit": "수익점수",
     "revenue": "예상수익(원)", "final": "최종점수", "type": "유형", "difficulty": "난이도"
 }
 for col in columns:
     tree.heading(col, text=headers[col])
     tree.column(col, width=80)
-tree.column("keyword", width=190)
+tree.column("priority", width=70, anchor="center")
+tree.column("keyword", width=180)
 tree.column("type", width=100)
 tree.column("revenue", width=95)
 tree.column("addepth", width=85)
@@ -364,7 +419,7 @@ tree.bind("<<TreeviewSelect>>", lambda e: show_titles())
 right_pane = ttk.PanedWindow(main_pane, orient="vertical")
 main_pane.add(right_pane, weight=4)
 
-queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐 (예상 수익 기준, ⭐=숨은 고수익 키워드)")
+queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐 (글작성순위 기준, ⭐=숨은 고수익 키워드)")
 right_pane.add(queue_outer, weight=1)
 
 queue_canvas = tk.Canvas(queue_outer, height=280)
