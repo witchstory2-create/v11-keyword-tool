@@ -1,234 +1,292 @@
 # -*- coding: utf-8 -*-
 """
-naver_search_api.py (v17 - 수익형 키워드 발굴기)
+naver_search_api.py (v17.1)
+----------------------------------------------------
+네이버 API 3종 래퍼 + 개별 연결 테스트
+1) NaverSearchAPI   : 검색 Open API (블로그/뉴스 문서수)
+2) NaverDataLabAPI  : 데이터랩 검색어트렌드 (상승률)
+3) NaverAdsAPI      : 검색광고 API (검색량/경쟁도)
 
-1) NaverOpenAPI : developers.naver.com 발급 (Client ID / Client Secret)
-   - 블로그 검색 문서수(totalCount)  -> 포화도 계산용
-   - 뉴스 검색(search_news)          -> Discovery 소스 확장용
-   - 데이터랩 검색어트렌드(상대 지수) -> 스파이크율 계산용
-
-2) NaverAdAPI   : ads.naver.com 검색광고 > 도구 > API 사용 관리에서 발급
-                  (API License Key / Secret Key / Customer ID)
-   - 연관키워드 조회 -> 월간 검색량(PC+모바일), 경쟁정도(compIdx)
+표준 라이브러리만 사용 (urllib.request) -> requests 불필요, PyInstaller onefile 빌드에 안전.
 """
 
-import os
-import sys
 import json
 import time
 import hmac
-import base64
 import hashlib
+import base64
 import urllib.request
 import urllib.parse
-from datetime import datetime, timedelta
-
-USER_AGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) KeywordTool/17.0"
+import urllib.error
 
 
-def _app_dir():
-    if getattr(sys, "frozen", False):
-        return os.path.dirname(sys.executable)
-    return os.path.dirname(os.path.abspath(__file__))
-
-
-def write_debug_log(message: str):
-    path = os.path.join(_app_dir(), "trend_debug_log.txt")
+def _http_get(url, headers=None, timeout=6):
+    req = urllib.request.Request(url, headers=headers or {})
     try:
-        with open(path, "a", encoding="utf-8") as f:
-            ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            f.write(f"[{ts}] {message}\n")
-    except Exception:
-        pass
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            body = res.read().decode("utf-8", errors="replace")
+            return res.status, body
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return e.code, body
+    except urllib.error.URLError as e:
+        return -1, str(e.reason)
+    except Exception as e:
+        return -2, str(e)
 
 
-class NaverOpenAPI:
-    BLOG_SEARCH_URL = "https://openapi.naver.com/v1/search/blog.json"
-    NEWS_SEARCH_URL = "https://openapi.naver.com/v1/search/news.json"
-    DATALAB_URL = "https://openapi.naver.com/v1/datalab/search"
+def _http_post_json(url, payload, headers=None, timeout=6):
+    data = json.dumps(payload).encode("utf-8")
+    h = {"Content-Type": "application/json"}
+    if headers:
+        h.update(headers)
+    req = urllib.request.Request(url, data=data, headers=h, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as res:
+            body = res.read().decode("utf-8", errors="replace")
+            return res.status, body
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", errors="replace")
+        except Exception:
+            pass
+        return e.code, body
+    except urllib.error.URLError as e:
+        return -1, str(e.reason)
+    except Exception as e:
+        return -2, str(e)
 
-    def __init__(self, client_id: str, client_secret: str):
-        self.client_id = client_id
-        self.client_secret = client_secret
 
-    def _headers(self, content_type_json=False):
-        h = {
+def _diagnose(status, body, kind):
+    """HTTP status/body -> 사람이 읽을 수 있는 실패 원인 문자열"""
+    if status == 200:
+        return "OK"
+    if status == 401:
+        if kind == "search":
+            return "401 인증 실패 - 검색 API Client ID/Secret 값을 확인하세요."
+        if kind == "datalab":
+            return "401 인증 실패 - 데이터랩 Client ID/Secret 값을 확인하세요."
+        if kind == "ads":
+            return "401 인증 실패 - License Key 또는 Secret Key 값을 확인하세요."
+    if status == 403:
+        return "403 권한 없음 - 해당 애플리케이션에 이 API 사용 권한이 추가되지 않았습니다."
+    if status == 404:
+        if kind == "ads":
+            return "404 Customer ID 오류 - Customer ID 값을 확인하세요(숫자만)."
+        return "404 요청 주소 오류"
+    if status == 429:
+        return "429 호출 한도 초과 - 잠시 후 다시 시도하세요."
+    if status == -1:
+        return f"네트워크 오류(URLError): {body}"
+    if status == -2:
+        return f"알 수 없는 오류: {body}"
+    if body:
+        try:
+            j = json.loads(body)
+            msg = j.get("errorMessage") or j.get("message") or j.get("errorCode")
+            if msg:
+                return f"HTTP {status} - {msg}"
+        except Exception:
+            pass
+    return f"HTTP {status} - 알 수 없는 오류"
+
+
+# ------------------------------------------------------------------
+# 1) 네이버 검색 API (Open API) - 문서수 조회
+# ------------------------------------------------------------------
+class NaverSearchAPI:
+    def __init__(self, client_id, client_secret):
+        self.client_id = (client_id or "").strip()
+        self.client_secret = (client_secret or "").strip()
+
+    def _headers(self):
+        return {
             "X-Naver-Client-Id": self.client_id,
             "X-Naver-Client-Secret": self.client_secret,
-            "User-Agent": USER_AGENT,
         }
-        if content_type_json:
-            h["Content-Type"] = "application/json"
-        return h
+
+    def _sanity_check(self):
+        if self.client_id.isdigit() and len(self.client_id) <= 10:
+            return ("검색 API Client ID 값이 숫자로만 되어 있어 의심스럽습니다. "
+                    "검색광고 Customer ID 값과 바뀐 것은 아닌지 확인하세요.")
+        if len(self.client_secret) < 6:
+            return "검색 API Client Secret 값이 너무 짧습니다. 값을 다시 확인하세요."
+        return None
 
     def test_connection(self):
+        warn = self._sanity_check()
+        if not self.client_id or not self.client_secret:
+            return False, "Client ID/Secret이 입력되지 않았습니다.", warn or ""
+        url = "https://openapi.naver.com/v1/search/blog.json?query=%s&display=1" % urllib.parse.quote("테스트")
+        status, body = _http_get(url, headers=self._headers())
+        if status == 200:
+            return True, "✅ 연결 성공", warn or ""
+        return False, "❌ " + _diagnose(status, body, "search"), warn or ""
+
+    def _search_total(self, kind, query):
+        url = "https://openapi.naver.com/v1/search/%s.json?query=%s&display=1" % (
+            kind, urllib.parse.quote(query))
+        status, body = _http_get(url, headers=self._headers())
+        if status != 200:
+            return None, _diagnose(status, body, "search")
         try:
-            self.get_blog_doc_count("테스트")
-            return True, "네이버 검색 API 연결 성공"
+            j = json.loads(body)
+            return int(j.get("total", 0)), None
         except Exception as e:
-            return False, f"네이버 검색 API 연결 실패: {e}"
+            return None, f"응답 파싱 오류: {e}"
 
-    def get_blog_doc_count(self, keyword: str):
-        try:
-            params = urllib.parse.urlencode({"query": keyword, "display": 1})
-            url = f"{self.BLOG_SEARCH_URL}?{params}"
-            req = urllib.request.Request(url, headers=self._headers())
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            return int(data.get("total", 0))
-        except Exception as e:
-            write_debug_log(f"[blog_doc_count] '{keyword}' 실패: {e}")
-            return None
+    def get_blog_doc_count(self, query):
+        return self._search_total("blog", query)
 
-    def search_news(self, query: str, display=20, sort="date"):
-        try:
-            display = min(max(display, 1), 100)
-            params = urllib.parse.urlencode({"query": query, "display": display, "sort": sort})
-            url = f"{self.NEWS_SEARCH_URL}?{params}"
-            req = urllib.request.Request(url, headers=self._headers())
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            return data.get("items", [])
-        except Exception as e:
-            write_debug_log(f"[search_news] '{query}' 실패: {e}")
-            return []
-
-    def get_datalab_trend(self, keyword: str, recent_days=3, base_days=14):
-        try:
-            end = datetime.now()
-            start = end - timedelta(days=recent_days + base_days)
-            body = {
-                "startDate": start.strftime("%Y-%m-%d"),
-                "endDate": end.strftime("%Y-%m-%d"),
-                "timeUnit": "date",
-                "keywordGroups": [{"groupName": keyword, "keywords": [keyword]}],
-            }
-            data_bytes = json.dumps(body).encode("utf-8")
-            req = urllib.request.Request(
-                self.DATALAB_URL, data=data_bytes,
-                headers=self._headers(content_type_json=True), method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                result = json.loads(resp.read().decode("utf-8"))
-
-            points = result["results"][0]["data"]
-            if not points:
-                return {"spike_ratio": 1.0, "status": "미검증"}
-
-            values = [p["ratio"] for p in points]
-            recent_vals = values[-recent_days:]
-            base_vals = values[:-recent_days] if len(values) > recent_days else values
-
-            recent_avg = sum(recent_vals) / max(len(recent_vals), 1)
-            base_avg = sum(base_vals) / max(len(base_vals), 1)
-
-            if base_avg <= 0.01:
-                spike_ratio = 3.0 if recent_avg > 0 else 1.0
-            else:
-                spike_ratio = recent_avg / base_avg
-
-            if spike_ratio >= 2.0:
-                status = "급증"
-            elif spike_ratio >= 1.3:
-                status = "상승"
-            elif spike_ratio >= 0.7:
-                status = "평이"
-            else:
-                status = "하락"
-
-            return {"spike_ratio": round(spike_ratio, 2), "status": status}
-        except Exception as e:
-            write_debug_log(f"[datalab_trend] '{keyword}' 실패: {e}")
-            return {"spike_ratio": 1.0, "status": "미검증"}
+    def get_news_doc_count(self, query):
+        return self._search_total("news", query)
 
 
-class NaverAdAPI:
-    BASE_URL = "https://api.searchad.naver.com"
+# ------------------------------------------------------------------
+# 2) 데이터랩 API - 검색어 트렌드(상승률)
+# ------------------------------------------------------------------
+class NaverDataLabAPI:
+    def __init__(self, client_id, client_secret):
+        self.client_id = (client_id or "").strip()
+        self.client_secret = (client_secret or "").strip()
 
-    def __init__(self, api_key: str, secret_key: str, customer_id: str):
-        self.api_key = api_key
-        self.secret_key = secret_key
-        self.customer_id = customer_id
-
-    def _signature(self, timestamp: str, method: str, uri: str) -> str:
-        message = f"{timestamp}.{method}.{uri}"
-        digest = hmac.new(bytes(self.secret_key, "utf-8"), bytes(message, "utf-8"), hashlib.sha256).digest()
-        return base64.b64encode(digest).decode()
-
-    def _headers(self, method: str, uri: str):
-        timestamp = str(round(time.time() * 1000))
-        signature = self._signature(timestamp, method, uri)
+    def _headers(self):
         return {
-            "Content-Type": "application/json; charset=UTF-8",
-            "X-Timestamp": timestamp,
-            "X-API-KEY": self.api_key,
-            "X-Customer": str(self.customer_id),
-            "X-Signature": signature,
+            "X-Naver-Client-Id": self.client_id,
+            "X-Naver-Client-Secret": self.client_secret,
         }
 
     def test_connection(self):
-        try:
-            self.get_related_keywords("보험")
-            return True, "네이버 검색광고 API 연결 성공"
-        except Exception as e:
-            return False, f"네이버 검색광고 API 연결 실패: {e}"
+        if not self.client_id or not self.client_secret:
+            return False, "Client ID/Secret이 입력되지 않았습니다.", ""
+        ok, ratio, err = self.get_spike_ratio("테스트")
+        if ok:
+            return True, "✅ 연결 성공", ""
+        hint = ""
+        if err and ("024" in err or "권한" in err):
+            hint = "네이버 개발자센터 애플리케이션 설정에서 '데이터랩(검색어트렌드)' API 사용을 추가했는지 확인하세요."
+        return False, "❌ " + (err or "알 수 없는 오류"), hint
 
-    def get_related_keywords(self, keyword: str):
+    def get_trend(self, keyword, days=30):
+        import datetime
+        end = datetime.date.today()
+        start = end - datetime.timedelta(days=days)
+        payload = {
+            "startDate": start.isoformat(),
+            "endDate": end.isoformat(),
+            "timeUnit": "date",
+            "keywordGroups": [{"groupName": keyword, "keywords": [keyword]}],
+        }
+        status, body = _http_post_json(
+            "https://openapi.naver.com/v1/datalab/search", payload, headers=self._headers())
+        if status != 200:
+            return None, _diagnose(status, body, "datalab")
+        try:
+            j = json.loads(body)
+            data = j["results"][0]["data"]
+            return data, None
+        except Exception as e:
+            return None, f"응답 파싱 오류: {e}"
+
+    def get_spike_ratio(self, keyword, days=30, recent_days=3):
+        data, err = self.get_trend(keyword, days=days)
+        if data is None:
+            return False, None, err
+        if not data:
+            return True, 1.0, None
+        ratios = [d.get("ratio", 0) for d in data]
+        if len(ratios) <= recent_days:
+            recent = ratios[-1:]
+            base = ratios[:-1] or [1]
+        else:
+            recent = ratios[-recent_days:]
+            base = ratios[:-recent_days]
+        recent_avg = sum(recent) / max(len(recent), 1)
+        base_avg = sum(base) / max(len(base), 1)
+        if base_avg <= 0:
+            base_avg = 0.1
+        spike = recent_avg / base_avg
+        return True, round(spike, 3), None
+
+
+# ------------------------------------------------------------------
+# 3) 검색광고 API - 검색량 / 경쟁도
+# ------------------------------------------------------------------
+class NaverAdsAPI:
+    BASE = "https://api.naver.com"
+
+    def __init__(self, customer_id, license_key, secret_key):
+        self.customer_id = (customer_id or "").strip()
+        self.license_key = (license_key or "").strip()
+        self.secret_key = (secret_key or "").strip()
+
+    def _signature(self, timestamp, method, uri):
+        message = f"{timestamp}.{method}.{uri}"
+        h = hmac.new(self.secret_key.encode("utf-8"), message.encode("utf-8"), hashlib.sha256)
+        return base64.b64encode(h.digest()).decode("utf-8")
+
+    def _headers(self, method, uri):
+        timestamp = str(int(time.time() * 1000))
+        return {
+            "X-Timestamp": timestamp,
+            "X-API-KEY": self.license_key,
+            "X-Customer": self.customer_id,
+            "X-Signature": self._signature(timestamp, method, uri),
+        }
+
+    def _sanity_check(self):
+        if self.customer_id and not self.customer_id.isdigit():
+            return ("Customer ID 값에 숫자가 아닌 문자가 포함되어 있습니다. "
+                    "검색 API Client ID 값과 바뀐 것은 아닌지 확인하세요.")
+        return None
+
+    def test_connection(self):
+        warn = self._sanity_check()
+        if not self.customer_id or not self.license_key or not self.secret_key:
+            return False, "Customer ID / License Key / Secret Key 중 누락된 값이 있습니다.", warn or ""
         uri = "/keywordstool"
-        method = "GET"
-        params = {"hintKeywords": keyword, "showDetail": "1"}
-        query = urllib.parse.urlencode(params)
-        url = f"{self.BASE_URL}{uri}?{query}"
+        query = "hintKeywords=%s&showDetail=1" % urllib.parse.quote("테스트")
+        url = self.BASE + uri + "?" + query
+        headers = self._headers("GET", uri)
+        status, body = _http_get(url, headers=headers)
+        if status == 200:
+            return True, "✅ 연결 성공", warn or ""
+        return False, "❌ " + _diagnose(status, body, "ads"), warn or ""
+
+    def get_keyword_stats(self, keyword):
+        uri = "/keywordstool"
+        query = "hintKeywords=%s&showDetail=1" % urllib.parse.quote(keyword)
+        url = self.BASE + uri + "?" + query
+        headers = self._headers("GET", uri)
+        status, body = _http_get(url, headers=headers)
+        if status != 200:
+            return None, _diagnose(status, body, "ads")
         try:
-            req = urllib.request.Request(url, headers=self._headers(method, uri), method=method)
-            with urllib.request.urlopen(req, timeout=6) as resp:
-                data = json.loads(resp.read().decode("utf-8"))
-            return data.get("keywordList", [])
+            j = json.loads(body)
+            lst = j.get("keywordList", [])
+            if not lst:
+                return {"pc": 0, "mobile": 0, "total": 0, "comp_idx": "낮음"}, None
+            top = lst[0]
+
+            def _num(v):
+                if isinstance(v, str):
+                    v = v.replace("< ", "").replace(",", "").strip()
+                    if v == "" or not v.isdigit():
+                        return 0
+                    return int(v)
+                try:
+                    return int(v)
+                except Exception:
+                    return 0
+
+            pc = _num(top.get("monthlyPcQcCnt", 0))
+            mobile = _num(top.get("monthlyMobileQcCnt", 0))
+            comp = top.get("compIdx", "낮음")
+            return {"pc": pc, "mobile": mobile, "total": pc + mobile, "comp_idx": comp}, None
         except Exception as e:
-            write_debug_log(f"[related_keywords] '{keyword}' 실패: {e}")
-            return []
-
-    def get_search_volume_and_competition(self, keyword: str):
-        results = self.get_related_keywords(keyword)
-        if not results:
-            return None, None
-
-        target = None
-        norm_kw = keyword.replace(" ", "")
-        for row in results:
-            if str(row.get("relKeyword", "")).replace(" ", "") == norm_kw:
-                target = row
-                break
-        if target is None:
-            target = results[0]
-
-        def _to_int(v):
-            if isinstance(v, str) and v.strip().startswith("<"):
-                return 5
-            try:
-                return int(v)
-            except Exception:
-                return 0
-
-        pc = _to_int(target.get("monthlyPcQcCnt", 0))
-        mobile = _to_int(target.get("monthlyMobileQcCnt", 0))
-        comp = target.get("compIdx", None)
-        return pc + mobile, comp
-
-
-COMP_IDX_MAP = {"낮음": 1, "중간": 2, "높음": 3}
-
-
-def verify_keyword(keyword: str, open_api: "NaverOpenAPI", ad_api: "NaverAdAPI"):
-    doc_count = open_api.get_blog_doc_count(keyword)
-    trend = open_api.get_datalab_trend(keyword)
-    search_volume, comp_label = ad_api.get_search_volume_and_competition(keyword)
-
-    return {
-        "doc_count": doc_count,
-        "spike_ratio": trend.get("spike_ratio", 1.0),
-        "trend_status": trend.get("status", "미검증"),
-        "search_volume": search_volume,
-        "comp_label": comp_label,
-        "comp_idx": COMP_IDX_MAP.get(comp_label, 0),
-    }
+            return None, f"응답 파싱 오류: {e}"
