@@ -1,135 +1,145 @@
-import requests
+# collector.py
+# v16.2 - 이슈 키워드 후보 수집기
+
 import re
+import feedparser
 from collections import Counter
 
-RSS_URLS = [
+RSS_FEEDS = [
     "https://news.google.com/rss?hl=ko&gl=KR&ceid=KR:ko",
     "https://news.google.com/rss/search?q=지원금&hl=ko&gl=KR&ceid=KR:ko",
     "https://news.google.com/rss/search?q=환급&hl=ko&gl=KR&ceid=KR:ko",
-    "https://news.google.com/rss/search?q=연금&hl=ko&gl=KR&ceid=KR:ko",
     "https://news.google.com/rss/search?q=대출&hl=ko&gl=KR&ceid=KR:ko",
     "https://news.google.com/rss/search?q=보험&hl=ko&gl=KR&ceid=KR:ko",
+    "https://news.google.com/rss/search?q=연금&hl=ko&gl=KR&ceid=KR:ko",
 ]
 
-BLOCK_WORDS = [
-    "조선일보", "중앙일보", "동아일보", "한겨레", "경향신문", "매일경제", "한국경제",
-    "연합뉴스", "뉴스", "신문", "기자", "단독", "속보", "종합", "광고", "구독",
-    "포토", "영상", "인터뷰", "사설", "칼럼", "논평", "관련", "본문",
-    "무단", "전재", "배포", "금지"
-]
+CLEAN_PATTERN = re.compile(r"[\[\(【].*?[\]\)】]|[\"“”'‘’]|…|·")
 
-MONEY_TOPICS = [
-    "환급", "지원금", "연금", "보험", "세금", "청약", "대출", "금리",
-    "건강보험", "자동차보험", "카드", "절세", "세액공제", "공제",
-    "실업급여", "국민연금", "퇴직연금", "주택청약", "전세대출"
-]
+DATE_TOKEN_PATTERN = re.compile(
+    r"^\d{1,4}(년|월|일|시|분)$|^\d{1,2}(월|일)\d{0,2}(일)?$|^(오늘|내일|어제|이번주|다음주)$"
+)
 
-MIN_MENTION_COUNT = 2  # 최소 2회 이상 실제 등장해야 후보로 인정
+STOPWORD_TAIL = {
+    "출시", "이벤트", "마감", "매출", "전망", "시작", "종료",
+    "연장", "개최", "안내", "발표", "확대", "축소", "논란",
+    "인상", "인하", "우려", "주의", "경고",
+}
 
-DEFAULT_KEYWORDS = [
-    "건강보험료 환급", "국민연금 개편", "퇴직연금 수령방법", "연금저축 세액공제",
-    "청약 조건", "전세대출 금리", "자동차보험료 인상", "실업급여 조건",
-    "지원금 신청", "세금 환급 조회", "IRP 세액공제", "연말정산 환급",
-    "주택청약 조건", "자동차보험 비교", "건강보험료 조회"
-]
+GENERIC_SEED_WORDS = {
+    "환급", "대출", "보험", "지원금", "연금", "국민연금", "적금",
+    "예금", "세금", "카드", "수당", "급여", "복지", "혜택",
+}
+
+BLOCKED_WORDS = {
+    "그리고", "하지만", "이번", "정부", "관련", "위해", "통해",
+    "가장", "모든", "많은", "전국", "오늘", "내일",
+}
+
+MIN_MENTION_COUNT = 2  # 결과가 너무 적으면 1로 낮춰서 튜닝
 
 
-def fetch_news_items():
-    """RSS에서 제목 리스트만 수집한다."""
-    items = []
-    for url in RSS_URLS:
+def _clean_title(title: str) -> str:
+    title = CLEAN_PATTERN.sub(" ", title)
+    title = re.sub(r"\s+", " ", title).strip()
+    return title
+
+
+def _is_valid_token(token: str) -> bool:
+    if len(token) < 2:
+        return False
+    if DATE_TOKEN_PATTERN.match(token):
+        return False
+    if token in BLOCKED_WORDS:
+        return False
+    if token in STOPWORD_TAIL:
+        return False
+    if token.isdigit():
+        return False
+    return True
+
+
+def fetch_all_titles() -> list:
+    titles = []
+    seen = set()
+    for url in RSS_FEEDS:
         try:
-            res = requests.get(url, timeout=10)
-            text = res.text
-            blocks = re.findall(r"<item>(.*?)</item>", text, re.S)
-            for block in blocks:
-                title_match = re.search(r"<title>(.*?)</title>", block)
-                if not title_match:
-                    continue
-                title = re.sub(r"<!\[CDATA\[|\]\]>", "", title_match.group(1))
-                title = re.sub(r"\s-\s.*$", "", title).strip()
-                if title:
-                    items.append(title)
-        except Exception:
-            continue
-    return items
+            feed = feedparser.parse(url)
+            for entry in feed.entries:
+                t = _clean_title(entry.title)
+                if t and t not in seen:
+                    seen.add(t)
+                    titles.append(t)
+        except Exception as e:
+            print(f"[RSS 수집 실패] {url} -> {e}")
+    return titles
 
 
-def is_bad_word(word):
-    if len(word) < 2:
-        return True
-    if any(block in word for block in BLOCK_WORDS):
-        return True
-    if re.search(r"[a-zA-Z]{3,}", word):
-        return True
-    return False
+def _is_money_topic(phrase: str) -> bool:
+    money_keywords = [
+        "지원금", "환급", "대출", "보험", "연금", "수당", "복지",
+        "세금", "카드", "혜택", "적금", "예금", "급여", "상품권",
+    ]
+    return any(mk in phrase for mk in money_keywords)
 
 
-def extract_bigrams(title):
-    """실제 뉴스 제목에서 인접한 단어쌍만 뽑는다. 조합 생성이 아니라 실제 등장 순서 기반."""
-    clean = re.sub(r"[^가-힣0-9 ]", " ", title)
-    parts = [p.strip() for p in clean.split() if not is_bad_word(p.strip())]
-
-    bigrams = []
-    for i in range(len(parts) - 1):
-        pair = f"{parts[i]} {parts[i+1]}"
-        if 3 <= len(pair) <= 25:
-            bigrams.append(pair)
-
-    return parts, bigrams
-
-
-def collect_issue_keywords():
-    """
-    반환값: [{"keyword": str, "mentions": int, "is_money_topic": bool}, ...]
-    뉴스에 실제로 등장한 단어/단어쌍만 후보로 인정한다.
-    돈이 되는 주제와 무관한 bigram은 후보에서 제외한다(노이즈 필터링).
-    """
-    titles = fetch_news_items()
-
-    word_counter = Counter()
-    bigram_counter = Counter()
+def extract_candidates(titles: list) -> list:
+    counter = Counter()
 
     for title in titles:
-        words, bigrams = extract_bigrams(title)
-        word_counter.update(words)
-        bigram_counter.update(bigrams)
+        tokens = [tok for tok in title.split(" ") if tok]
 
-    candidates = {}
+        for tok in tokens:
+            if _is_valid_token(tok):
+                counter[tok] += 1
 
-    # 단일 단어 후보: 돈이 되는 주제어가 실제 빈도 이상 등장했을 때만
-    for word, cnt in word_counter.items():
-        if cnt >= MIN_MENTION_COUNT and any(topic in word for topic in MONEY_TOPICS):
-            candidates[word] = {
-                "keyword": word,
-                "mentions": cnt,
-                "is_money_topic": True,
-            }
+        for i in range(len(tokens) - 1):
+            a, b = tokens[i], tokens[i + 1]
+            if not _is_valid_token(a) or not _is_valid_token(b):
+                continue
+            if b in STOPWORD_TAIL:
+                continue
+            phrase = f"{a} {b}"
+            counter[phrase] += 1
 
-    # 인접 단어쌍 후보: 실제로 나란히 등장한 조합 중, 돈이 되는 주제와 관련 있는 것만
-    for pair, cnt in bigram_counter.items():
-        if cnt < MIN_MENTION_COUNT:
+    candidates = []
+    for phrase, mentions in counter.items():
+        if mentions < MIN_MENTION_COUNT:
             continue
 
-        has_money = any(topic in pair for topic in MONEY_TOPICS)
-        if not has_money:
-            continue  # 돈과 무관한 노이즈 조합은 후보에서 제외
+        word_count = len(phrase.split(" "))
+        is_generic = word_count == 1 and phrase in GENERIC_SEED_WORDS
+        money_topic = _is_money_topic(phrase)
 
-        if pair not in candidates:
-            candidates[pair] = {
-                "keyword": pair,
-                "mentions": cnt,
-                "is_money_topic": has_money,
-            }
+        candidates.append({
+            "keyword": phrase,
+            "mentions": mentions,
+            "word_count": word_count,
+            "is_generic": is_generic,
+            "money_topic": money_topic,
+        })
 
-    # 오늘 뉴스에서 후보가 부족할 경우를 대비한 기본 시드 키워드 (mentions=0, 신뢰도 낮음)
-    for kw in DEFAULT_KEYWORDS:
-        if kw not in candidates:
-            candidates[kw] = {
-                "keyword": kw,
-                "mentions": 0,
-                "is_money_topic": True,
-            }
+    candidates.sort(key=lambda x: x["mentions"], reverse=True)
+    return candidates[:100]
 
-    result = sorted(candidates.values(), key=lambda x: x["mentions"], reverse=True)
-    return result[:100]
+
+def collect_issue_keywords() -> list:
+    """app.py에서 호출하는 진입점 함수. 뉴스 수집 + 후보 추출을 한 번에 수행."""
+    titles = fetch_all_titles()
+    return extract_candidates(titles)
+
+
+if __name__ == "__main__":
+    titles = fetch_all_titles()
+    print(f"=== 수집된 뉴스 제목 총 {len(titles)}개 ===")
+    for t in titles[:30]:
+        print("-", t)
+
+    candidates = extract_candidates(titles)
+    print(f"\n=== 최종 후보 키워드 총 {len(candidates)}개 ===")
+    for c in candidates[:50]:
+        print(
+            f"{c['keyword']:<20} | mentions={c['mentions']:<3} | "
+            f"word_count={c['word_count']} | is_generic={c['is_generic']} | "
+            f"money_topic={c['money_topic']}"
+        )
