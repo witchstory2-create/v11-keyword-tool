@@ -1,257 +1,183 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v17 - 수익형 키워드 발굴기)
-
-Verification 데이터(문서수/검색량/DataLab)를 받아
-IssueScore / OpportunityScore를 계산하고,
-위험 판정 + 스파이크 하드컷을 적용해 최종 버킷을 분류한다.
-
-버킷 종류: TOP5 / TOP10 / 상시추천 / 보류 / 위험
+scorer.py (v17.1) - Verification + Scoring 단계
+검색량(검색광고API) / 문서수(검색API) / DataLab 상승률을 실측하여
+IssueScore, OpportunityScore, FinalScore를 계산하고 등급(TOP5/TOP10/보류/위험)을 매긴다.
+API 호출이 실패하면 해당 필드는 '검증 실패'로 명확히 표시하고, 실패 이유를 함께 기록한다.
 """
 
 import math
 
-CATEGORY_WEIGHTS = {
-    "보험": 1.4, "대출금융": 1.3, "세금": 1.3, "연금": 1.2,
-    "부동산": 1.1, "지원금": 1.0, "기타": 0.8,
-}
-
-# collector.py의 GENERIC_ROOT_BLOCK과 동일한 개념.
-# bigram 등 조합형 키워드 안에 이 단어가 '포함'되어 있고 문서수가 과도하면 위험 처리.
-GENERIC_ROOT_WORDS = {
-    "보험", "대출", "연금", "환급", "지원", "지원금", "정부", "세금", "카드",
-}
-
-SPIKE_HARDCUT = 1.3          # 이 미만이면 '이슈성 없음(상시성)'으로 강등
-STEADY_OPPORTUNITY_MIN = 0.55  # 상시성이어도 이 이상이면 '상시추천'으로 별도 표시
-RISK_DOC_COUNT_WITH_GENERIC = 300_000   # 범용어 포함 + 이 이상 문서수 -> 위험
-RISK_DOC_COUNT_ABSOLUTE = 1_000_000     # 범용어 여부와 무관하게 이 이상이면 무조건 위험
+SPIKE_HARDCUT = 1.3
+RISK_DOC_ABS = 1_000_000
+RISK_DOC_GENERIC = 300_000
+CPC_DEFAULT = 450
 
 
-def profit_label(weight: float) -> str:
-    if weight >= 1.3:
-        return "상"
-    if weight >= 1.0:
-        return "중"
-    return "하"
+def _log(fn, msg):
+    if fn:
+        fn(msg)
 
 
-def star_rating(final_score: float) -> str:
-    if final_score >= 85:
-        return "★★★★★"
-    if final_score >= 70:
-        return "★★★★☆"
-    if final_score >= 55:
-        return "★★★☆☆"
-    if final_score >= 40:
-        return "★★☆☆☆"
-    if final_score >= 25:
-        return "★☆☆☆☆"
-    return "☆☆☆☆☆"
+def _norm(value, max_value):
+    if not max_value or max_value <= 0:
+        return 0.0
+    return max(0.0, min(1.0, value / max_value))
 
 
-def _minmax_normalize(values):
-    finite = [v for v in values if v is not None]
-    if not finite:
-        return [0.0 for _ in values]
-    lo, hi = min(finite), max(finite)
-    if hi - lo < 1e-9:
-        return [0.5 if v is not None else 0.0 for v in values]
-    return [(v - lo) / (hi - lo) if v is not None else 0.0 for v in values]
+def estimate_monthly_revenue_won(search_volume, doc_count, cpc=CPC_DEFAULT,
+                                  ctr=0.03, ad_click_rate=0.35, rank_share=0.05):
+    if not search_volume or search_volume <= 0:
+        return None
+    saturation_penalty = 1.0
+    if doc_count and doc_count > 0:
+        saturation_penalty = 1.0 / (1.0 + math.log10(doc_count + 10) / 3.0)
+    visits = search_volume * rank_share * saturation_penalty
+    clicks = visits * ctr * ad_click_rate
+    revenue = clicks * cpc
+    return int(revenue)
 
 
-def saturation_multiplier(doc_count):
-    if doc_count is None:
-        return 0.6
-    if doc_count > 1_000_000:
-        return 0.10
-    if doc_count > 300_000:
-        return 0.25
-    if doc_count > 100_000:
-        return 0.50
-    if doc_count > 30_000:
-        return 0.80
-    return 1.0
+def verify_candidate(cand, search_api, datalab_api, ads_api, log=None):
+    keyword = cand["keyword"]
+    result = dict(cand)
+    result.update({
+        "doc_count": None, "doc_status": "검증 실패", "doc_error": None,
+        "search_volume": None, "search_status": "검증 실패", "search_error": None,
+        "comp_idx": None,
+        "spike_ratio": None, "datalab_status": "검증 실패", "datalab_error": None,
+    })
 
-
-def contains_generic_root(keyword: str) -> str or None:
-    """키워드에 포함된 범용 명사가 있으면 그 단어를 반환, 없으면 None."""
-    for root in GENERIC_ROOT_WORDS:
-        if root in keyword:
-            return root
-    return None
-
-
-def efficiency_label(search_volume, doc_count):
-    """검색량 대비 문서수 비율을 사람이 이해할 수 있는 등급으로 변환."""
-    if not search_volume or doc_count is None:
-        return None, "효율 미검증"
-    ratio = search_volume / max(doc_count, 1)
-    if ratio >= 5:
-        return ratio, "효율 매우 좋음"
-    if ratio >= 1:
-        return ratio, "효율 좋음"
-    if ratio >= 0.1:
-        return ratio, "효율 보통"
-    return ratio, "효율 나쁨(경쟁 과다)"
-
-
-def compute_scores(candidates: list):
-    if not candidates:
-        return []
-
-    mentions_list = [c.get("mentions", 0) for c in candidates]
-    spike_list = [min(c.get("spike_ratio", 1.0) or 1.0, 5.0) for c in candidates]
-    volume_list = [math.log1p(c.get("search_volume") or 0) for c in candidates]
-    recency_list = [c.get("recency", 0.3) for c in candidates]
-
-    norm_mentions = _minmax_normalize(mentions_list)
-    norm_spike = _minmax_normalize(spike_list)
-    norm_volume = _minmax_normalize(volume_list)
-    norm_recency = _minmax_normalize(recency_list)
-
-    # 검색량 대비 문서수 비율(효율)을 기회점수의 핵심 축으로 강화
-    efficiency_raw = []
-    for c in candidates:
-        vol = (c.get("search_volume") or 0) + 1
-        doc = c.get("doc_count")
-        doc_for_log = doc if (doc is not None and doc > 0) else 500_000
-        raw = vol / (math.log(doc_for_log + 10) ** 1.5)  # 문서수 페널티를 더 강하게
-        efficiency_raw.append(raw)
-    norm_efficiency = _minmax_normalize(efficiency_raw)
-
-    results = []
-    for i, c in enumerate(candidates):
-        issue_score = (
-            0.3 * norm_mentions[i] + 0.3 * norm_spike[i]
-            + 0.2 * norm_volume[i] + 0.2 * norm_recency[i]
-        )
-        sat_mult = saturation_multiplier(c.get("doc_count"))
-        opportunity_score = norm_efficiency[i] * sat_mult
-
-        cat = c.get("category", "기타")
-        cat_weight = CATEGORY_WEIGHTS.get(cat, 0.8)
-
-        # 가중합 방식: 기회점수(문서수/검색량 비율)에 더 큰 비중(0.65)
-        final_raw = (0.35 * issue_score + 0.65 * opportunity_score) * cat_weight
-
-        eff_ratio, eff_label = efficiency_label(c.get("search_volume"), c.get("doc_count"))
-
-        results.append({
-            **c,
-            "issue_score": round(issue_score, 3),
-            "opportunity_score": round(opportunity_score, 3),
-            "category_weight": cat_weight,
-            "profit_label": profit_label(cat_weight),
-            "final_raw": final_raw,
-            "efficiency_ratio": round(eff_ratio, 3) if eff_ratio is not None else None,
-            "efficiency_label": eff_label,
-        })
-
-    final_raws = [r["final_raw"] for r in results]
-    norm_final = _minmax_normalize(final_raws)
-    for r, nf in zip(results, norm_final):
-        r["final_score"] = round(nf * 100, 1)
-
-    # ---------------- 위험 판정 ----------------
-    for r in results:
-        generic_hit = contains_generic_root(r["keyword"])
-        doc = r.get("doc_count")
-        risk = False
-        risk_reasons = []
-
-        if doc is not None and doc > RISK_DOC_COUNT_ABSOLUTE:
-            risk = True
-            risk_reasons.append(f"문서수 {doc:,}건으로 극단적 과포화")
-        elif generic_hit and doc is not None and doc > RISK_DOC_COUNT_WITH_GENERIC:
-            risk = True
-            risk_reasons.append(f"범용 단어 '{generic_hit}' 포함 + 문서수 {doc:,}건 과포화")
-
-        r["risk"] = risk
-        r["risk_reasons"] = risk_reasons
-
-    # ---------------- 스파이크 하드컷 ----------------
-    for r in results:
-        spike = r.get("spike_ratio", 1.0) or 1.0
-        if spike < SPIKE_HARDCUT:
-            r["issue_status_final"] = "상시성"
+    if search_api and search_api.client_id and search_api.client_secret:
+        blog_total, err1 = search_api.get_blog_doc_count(keyword)
+        news_total, err2 = search_api.get_news_doc_count(keyword)
+        if blog_total is not None:
+            result["doc_count"] = blog_total + (news_total or 0)
+            result["doc_status"] = "검증 완료"
         else:
-            r["issue_status_final"] = r.get("trend_status", "상승")
-
-    # ---------------- 순위 부여 (위험 제외 대상만 랭킹) ----------------
-    non_risk = [r for r in results if not r["risk"]]
-    non_risk.sort(key=lambda r: r["final_score"], reverse=True)
-    for rank, r in enumerate(non_risk, start=1):
-        r["rank"] = rank
-
-    risk_items = [r for r in results if r["risk"]]
-    risk_items.sort(key=lambda r: r["final_score"], reverse=True)
-    for r in risk_items:
-        r["rank"] = None  # 위험 항목은 정식 순위에서 제외
-
-    # ---------------- 버킷 분류 ----------------
-    for r in results:
-        if r["risk"]:
-            r["bucket"] = "위험"
-        elif r["issue_status_final"] == "상시성":
-            r["bucket"] = "상시추천" if r["opportunity_score"] >= STEADY_OPPORTUNITY_MIN else "보류"
-        elif r["rank"] is not None and r["rank"] <= 5:
-            r["bucket"] = "TOP5"
-        elif r["rank"] is not None and r["rank"] <= 15:
-            r["bucket"] = "TOP10"
-        else:
-            r["bucket"] = "보류"
-
-    for r in results:
-        r["stars"] = star_rating(r["final_score"])
-        r["reason_tags"] = _build_reason_tags(r)
-
-    # 최종 정렬: 위험은 맨 아래, 그 외는 점수 내림차순
-    results.sort(key=lambda r: (r["risk"], -r["final_score"]))
-    return results
-
-
-def _build_reason_tags(r):
-    tags = []
-
-    mentions = r.get("mentions", 0)
-    src_cnt = r.get("source_count", 1)
-    if mentions >= 3:
-        src_txt = " (구글+네이버 동시 언급)" if src_cnt >= 2 else ""
-        tags.append(f"뉴스 언급 {mentions}건{src_txt}")
-
-    spike = r.get("spike_ratio")
-    status = r.get("trend_status", "미검증")
-    if spike is not None:
-        if r["issue_status_final"] == "상시성":
-            tags.append(f"DataLab 상승률 x{spike:.2f} (이슈성 낮음, 상시성)")
-        elif status == "급증":
-            tags.append(f"DataLab 급증 x{spike:.2f}")
-        elif status == "상승":
-            tags.append(f"DataLab 상승 x{spike:.2f}")
-        else:
-            tags.append("DataLab 미검증")
-
-    doc_count = r.get("doc_count")
-    if doc_count is not None:
-        tags.append(f"문서수 {doc_count:,}건")
+            result["doc_error"] = err1 or err2
+            _log(log, f"[scorer] 문서수 검증 실패({keyword}): {result['doc_error']}")
     else:
-        tags.append("문서수 미검증")
+        result["doc_error"] = "검색 API 키 미설정"
 
-    vol = r.get("search_volume")
-    if vol:
-        tags.append(f"검색량 {vol:,}회/월")
+    if ads_api and ads_api.customer_id and ads_api.license_key and ads_api.secret_key:
+        stats, err = ads_api.get_keyword_stats(keyword)
+        if stats is not None:
+            result["search_volume"] = stats["total"]
+            result["comp_idx"] = stats["comp_idx"]
+            result["search_status"] = "검증 완료"
+        else:
+            result["search_error"] = err
+            _log(log, f"[scorer] 검색량 검증 실패({keyword}): {err}")
+    else:
+        result["search_error"] = "검색광고 API 키 미설정"
 
-    if r.get("efficiency_label"):
-        eff_txt = r["efficiency_label"]
-        if r.get("efficiency_ratio") is not None:
-            eff_txt += f" (검색량÷문서수={r['efficiency_ratio']:.2f})"
-        tags.append(eff_txt)
+    if datalab_api and datalab_api.client_id and datalab_api.client_secret:
+        ok, spike, err = datalab_api.get_spike_ratio(keyword)
+        if ok:
+            result["spike_ratio"] = spike
+            result["datalab_status"] = "검증 완료"
+        else:
+            result["datalab_error"] = err
+            _log(log, f"[scorer] DataLab 검증 실패({keyword}): {err}")
+    else:
+        result["datalab_error"] = "DataLab API 키 미설정"
 
-    tags.append(f"예상 수익성 {r.get('profit_label', '-')}")
+    return result
 
-    if r.get("risk"):
-        for reason in r.get("risk_reasons", []):
-            tags.append(f"[위험] {reason}")
 
+def _recommend_tags(r):
+    tags = []
+    if r.get("news_count"):
+        tags.append(f"뉴스 언급 {r['news_count']}건")
+    if r.get("spike_ratio") is not None:
+        tags.append(f"DataLab 상승률 x{r['spike_ratio']:.2f}")
+    if r.get("search_volume") is not None:
+        tags.append(f"검색량 {r['search_volume']:,}")
+    if r.get("doc_count") is not None:
+        tags.append(f"문서수 {r['doc_count']:,}")
+    if r.get("efficiency") is not None:
+        tags.append(f"효율(검색량/문서수) {r['efficiency']:.2f}")
     return tags
+
+
+def _risk_reasons(r):
+    reasons = []
+    if r.get("generic_flag"):
+        reasons.append("범용(상시성) 키워드 포함")
+    doc = r.get("doc_count")
+    if doc is not None:
+        if r.get("generic_flag") and doc > RISK_DOC_GENERIC:
+            reasons.append(f"범용어+문서수 과다({doc:,}건)")
+        if doc > RISK_DOC_ABS:
+            reasons.append(f"문서수 절대치 과다({doc:,}건)")
+    if r.get("spike_ratio") is not None and r["spike_ratio"] < SPIKE_HARDCUT:
+        reasons.append(f"DataLab 상승률 미달(x{r['spike_ratio']:.2f} < x{SPIKE_HARDCUT})")
+    return reasons
+
+
+def score_candidates(candidates, search_api=None, datalab_api=None, ads_api=None,
+                      verify_top_n=40, log=None):
+    _log(log, f"[scorer] 검증 대상 {min(len(candidates), verify_top_n)}개")
+    verified = []
+    for cand in candidates[:verify_top_n]:
+        v = verify_candidate(cand, search_api, datalab_api, ads_api, log=log)
+        verified.append(v)
+
+    max_news = max([v.get("news_count", 0) for v in verified] or [1])
+    max_search = max([v.get("search_volume") or 0 for v in verified] or [1])
+
+    for v in verified:
+        doc = v.get("doc_count")
+        sv = v.get("search_volume")
+        spike = v.get("spike_ratio")
+
+        if sv is not None and doc is not None:
+            v["efficiency"] = sv / math.log(doc + 10)
+        else:
+            v["efficiency"] = None
+
+        issue_score = (
+            0.3 * _norm(v.get("news_count", 0), max_news)
+            + 0.3 * _norm((spike or 0), 3.0)
+            + 0.2 * _norm((sv or 0), max_search)
+            + 0.2 * 1.0
+        )
+        v["issue_score"] = round(issue_score, 4)
+
+        if sv is not None and doc is not None:
+            opp_score = (sv * max(spike or 1.0, 1.0)) / math.log(doc + 10)
+        else:
+            opp_score = 0.0
+        v["opportunity_score"] = round(opp_score, 4)
+
+        generic_penalty = 0.4 if v.get("generic_flag") else 1.0
+        verified_cnt = sum([
+            1 if v["doc_status"] == "검증 완료" else 0,
+            1 if v["search_status"] == "검증 완료" else 0,
+            1 if v["datalab_status"] == "검증 완료" else 0,
+        ])
+        confidence = verified_cnt / 3.0
+        v["confidence"] = confidence
+
+        final_score = v["issue_score"] * 40 + min(v["opportunity_score"], 500) * 0.1
+        final_score = final_score * generic_penalty * (0.4 + 0.6 * confidence)
+        v["final_score"] = round(final_score, 2)
+
+        v["risk_reasons"] = _risk_reasons(v)
+        v["recommend_tags"] = _recommend_tags(v)
+        v["estimated_revenue_won"] = estimate_monthly_revenue_won(sv, doc) if (sv and doc is not None) else None
+
+    verified.sort(key=lambda x: x["final_score"], reverse=True)
+
+    for i, v in enumerate(verified):
+        if v["risk_reasons"]:
+            v["grade"] = "위험"
+        elif i < 5 and v["confidence"] >= 0.34:
+            v["grade"] = "TOP5"
+        elif i < 10 and v["confidence"] >= 0.34:
+            v["grade"] = "TOP10"
+        else:
+            v["grade"] = "보류"
+
+    return verified
