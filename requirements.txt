@@ -1,4 +1,1 @@
-requests
 pyinstaller
-google-generativeai
-feedparser
