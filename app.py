@@ -7,9 +7,15 @@ from scorer import score_keyword
 from title_engine import make_titles
 
 
+analysis_results = []
+
+
 def run_analysis():
+    global analysis_results
+
     tree.delete(*tree.get_children())
     title_box.delete("1.0", tk.END)
+    analysis_results = []
 
     cid = customer_entry.get().strip()
     api = api_entry.get().strip()
@@ -35,7 +41,7 @@ def run_analysis():
     results = []
     error_count = 0
 
-    for kw in issue_keywords[:80]:
+    for kw in issue_keywords[:100]:
         try:
             data = get_keyword_data(kw, cid, api, secret)
 
@@ -55,7 +61,7 @@ def run_analysis():
             "분석 결과 없음",
             f"분석 결과가 0개입니다.\n후보 키워드 수: {len(issue_keywords)}개\nAPI 오류 수: {error_count}개"
         )
-        status.config("분석 결과 없음")
+        status.config(text="분석 결과 없음")
         return
 
     results.sort(key=lambda x: x["final_score"], reverse=True)
@@ -68,7 +74,9 @@ def run_analysis():
             seen.add(r["keyword"])
             unique_results.append(r)
 
-    for r in unique_results[:80]:
+    analysis_results = unique_results
+
+    for r in unique_results[:100]:
         tree.insert("", "end", values=(
             r["keyword"],
             r["pc"],
@@ -96,7 +104,6 @@ def show_titles():
     search_titles, home_titles = make_titles(keyword)
 
     title_box.delete("1.0", tk.END)
-
     title_box.insert(tk.END, f"키워드: {keyword}\n\n")
 
     title_box.insert(tk.END, "[검색용 제목 3개]\n")
@@ -108,13 +115,109 @@ def show_titles():
         title_box.insert(tk.END, f"{i}. {title}\n")
 
 
+def make_writing_guide(keyword):
+    guides = []
+
+    if "환급" in keyword:
+        guides = [
+            "환급 대상이 누구인지 먼저 설명",
+            "조회 방법과 확인 경로 정리",
+            "신청 전 확인해야 할 조건 정리",
+            "놓치기 쉬운 주의사항 설명"
+        ]
+    elif "연금" in keyword:
+        guides = [
+            "연금 종류와 기본 개념 정리",
+            "수령 조건과 방식 비교",
+            "세금이나 공제와 연결되는 부분 설명",
+            "독자가 확인해야 할 체크포인트 정리"
+        ]
+    elif "보험" in keyword:
+        guides = [
+            "보장 범위와 차이 설명",
+            "가입 유도 없이 정보형 비교로 작성",
+            "비슷한 보험 용어 차이 정리",
+            "주의해야 할 약관·조건 중심 설명"
+        ]
+    elif "청약" in keyword:
+        guides = [
+            "청약 조건과 자격 기준 설명",
+            "일정이나 신청 전 확인사항 정리",
+            "무주택·소득·가점 기준 비교",
+            "처음 보는 사람이 헷갈리는 부분 설명"
+        ]
+    elif "대출" in keyword:
+        guides = [
+            "대출 종류와 조건을 정보형으로 설명",
+            "승인 유도 표현 없이 기준만 정리",
+            "금리·한도·상환 방식 차이 비교",
+            "주의할 점과 확인사항 중심으로 작성"
+        ]
+    elif "세금" in keyword or "세액" in keyword or "공제" in keyword:
+        guides = [
+            "공제 대상과 조건 설명",
+            "연말정산 또는 세금 환급과 연결",
+            "사례 중심으로 이해 쉽게 구성",
+            "확정 표현 없이 확인사항 중심 작성"
+        ]
+    else:
+        guides = [
+            "이슈가 왜 생겼는지 배경 설명",
+            "독자가 궁금해할 핵심 질문 정리",
+            "기존 정보와 달라진 점 비교",
+            "마지막에 확인해야 할 사항 정리"
+        ]
+
+    return guides
+
+
+def show_recommended_post():
+    if not analysis_results:
+        messagebox.showwarning("분석 필요", "먼저 키워드 분석을 실행하세요.")
+        return
+
+    best = analysis_results[0]
+    keyword = best["keyword"]
+
+    search_titles, home_titles = make_titles(keyword)
+    guides = make_writing_guide(keyword)
+
+    title_box.delete("1.0", tk.END)
+
+    title_box.insert(tk.END, "[오늘 1순위 추천 글]\n\n")
+    title_box.insert(tk.END, f"추천 키워드: {keyword}\n")
+    title_box.insert(
+        tk.END,
+        f"추천 이유: 이슈점수 {best['issue_score']} / 수익점수 {best['profit_score']} / 최종점수 {best['final_score']} / 유형 {best['type']}\n\n"
+    )
+
+    title_box.insert(tk.END, "[검색용 제목 3개]\n")
+    for i, title in enumerate(search_titles, 1):
+        title_box.insert(tk.END, f"{i}. {title}\n")
+
+    title_box.insert(tk.END, "\n[홈판용 제목 3개]\n")
+    for i, title in enumerate(home_titles, 1):
+        title_box.insert(tk.END, f"{i}. {title}\n")
+
+    title_box.insert(tk.END, "\n[글 작성 방향]\n")
+    for i, guide in enumerate(guides, 1):
+        title_box.insert(tk.END, f"{i}. {guide}\n")
+
+    title_box.insert(tk.END, "\n[추천 본문 구조]\n")
+    title_box.insert(tk.END, "1. 도입부: 독자가 이 키워드를 검색한 상황으로 시작\n")
+    title_box.insert(tk.END, "2. 본문 1: 핵심 개념 또는 현재 이슈 설명\n")
+    title_box.insert(tk.END, "3. 본문 2: 조건·대상·차이 비교\n")
+    title_box.insert(tk.END, "4. 본문 3: 주의사항 또는 확인 방법\n")
+    title_box.insert(tk.END, "5. 결론: 지금 확인해야 할 핵심 요약\n")
+
+
 root = tk.Tk()
-root.title("v14 실시간 이슈 수익형 키워드 분석기")
-root.geometry("1150x750")
+root.title("v15 이슈 수익형 블로그 글 추천기")
+root.geometry("1180x780")
 
 title_label = tk.Label(
     root,
-    text="v14 실시간 이슈 수익형 키워드 분석기",
+    text="v15 이슈 수익형 블로그 글 추천기",
     font=("맑은 고딕", 17, "bold")
 )
 title_label.pack(pady=10)
@@ -141,17 +244,25 @@ analyze_button = tk.Button(
     button_frame,
     text="오늘 이슈+수익 키워드 분석",
     command=run_analysis,
-    width=30
+    width=28
 )
 analyze_button.pack(side="left", padx=5)
 
 title_button = tk.Button(
     button_frame,
-    text="제목 생성",
+    text="선택 키워드 제목 생성",
     command=show_titles,
-    width=20
+    width=22
 )
 title_button.pack(side="left", padx=5)
+
+recommend_button = tk.Button(
+    button_frame,
+    text="오늘 1순위 추천 글 보기",
+    command=show_recommended_post,
+    width=25
+)
+recommend_button.pack(side="left", padx=5)
 
 columns = (
     "keyword",
@@ -164,7 +275,7 @@ columns = (
     "type"
 )
 
-tree = ttk.Treeview(root, columns=columns, show="headings", height=20)
+tree = ttk.Treeview(root, columns=columns, show="headings", height=19)
 
 headers = {
     "keyword": "키워드",
@@ -181,12 +292,12 @@ for col in columns:
     tree.heading(col, text=headers[col])
     tree.column(col, width=120)
 
-tree.column("keyword", width=300)
-tree.column("type", width=120)
+tree.column("keyword", width=320)
+tree.column("type", width=130)
 
 tree.pack(fill="both", expand=True, padx=15, pady=10)
 
-title_box = tk.Text(root, height=9)
+title_box = tk.Text(root, height=12)
 title_box.pack(fill="x", padx=15, pady=5)
 
 status = tk.Label(root, text="대기 중")
