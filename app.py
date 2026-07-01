@@ -1,613 +1,702 @@
 # -*- coding: utf-8 -*-
 """
-app.py (v17.2) - 수익형 키워드 발굴기
-v16의 UX(작성 큐, 상태 관리, 제목/개요/FAQ/태그, TXT/CSV 저장, 클립보드 복사)
-+ v17 알고리즘(기사 단위 bigram, 검증 3종 API, 포화도 기반 채점)
-+ v17.2: 위험/보류 사유 분리 표시
+app.py (v18.2)
+네이버 블로그 수익형 키워드 발굴 시스템 - 메인 UI
+
+파이프라인:
+  collector.collect_candidates()  -> 후보 수집
+  profit_filter.filter_candidates() -> 수익형 필터링(카테고리 가중치/검색의도)
+  scorer.score_candidates()       -> 4단계 교차검증 + 점수화 + 등급 분류
+
+카드형 UI:
+  TOP5(금색) / TOP10(은색) / 보류(주황) / 위험(빨강) 4등급을
+  색상/배지/테두리로 구분되는 카드로 렌더링.
+
+표준 라이브러리(tkinter)만 사용 -> PyInstaller / GitHub Actions 빌드 호환.
+외부 유료 AI API, 추가 pip 패키지 사용하지 않음.
 """
 
 import os
 import sys
 import json
-import time
-import threading
-import tkinter as tk
-from tkinter import ttk, messagebox
 import csv
+import threading
+import queue
+import traceback
+from datetime import datetime
 
-from naver_search_api import NaverSearchAPI, NaverDataLabAPI, NaverAdsAPI
+import tkinter as tk
+from tkinter import ttk, messagebox, filedialog, scrolledtext
+
+# ---- 파이프라인 모듈 ----------------------------------------------------
 import collector
+import profit_filter
 import scorer
+from naver_search_api import NaverSearchAPI, NaverDataLabAPI, NaverAdsAPI
 
-APP_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
-CONFIG_PATH = os.path.join(APP_DIR, "api_config.json")
-STATUS_PATH = os.path.join(APP_DIR, "keyword_status.json")
-LOG_PATH = os.path.join(APP_DIR, "trend_debug_log.txt")
+APP_TITLE = "네이버 블로그 수익형 키워드 발굴기"
+APP_VERSION = "v18.2"
 
-COLOR_NAVY = "#152238"
-COLOR_BG = "#EEF1F6"
-COLOR_CARD = "#FFFFFF"
-COLOR_BLUE = "#2F6FED"
-COLOR_GREEN = "#1B8A5A"
-COLOR_RED = "#D64545"
-COLOR_ORANGE = "#C77B18"
-COLOR_GRAY = "#8A8F98"
-FONT_FAMILY = "맑은 고딕"
+BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
+LOG_FILE = os.path.join(BASE_DIR, "trend_debug_log.txt")
+
+DEFAULT_CATEGORIES = ["보험", "대출", "환급", "지원금", "연금", "세금",
+                       "청약", "부동산", "카드", "자동차보험", "건강보험"]
+
+# =========================================================================
+# 등급별 카드 스타일 정의
+# =========================================================================
+GRADE_STYLE = {
+    "TOP5":  {"bg": "#FFF6DC", "border": "#E6B800", "badge_bg": "#E6B800",
+              "badge_fg": "#3A2E00", "label": "\U0001F947 TOP5"},
+    "TOP10": {"bg": "#F1F3F6", "border": "#8C9BAB", "badge_bg": "#8C9BAB",
+              "badge_fg": "#FFFFFF", "label": "\U0001F948 TOP10"},
+    "보류":   {"bg": "#FFF1E0", "border": "#F39C12", "badge_bg": "#F39C12",
+              "badge_fg": "#FFFFFF", "label": "\u23F8 보류"},
+    "위험":   {"bg": "#FDEAEA", "border": "#E74C3C", "badge_bg": "#E74C3C",
+              "badge_fg": "#FFFFFF", "label": "\u26A0 위험"},
+}
+GRADE_ORDER = ["TOP5", "TOP10", "보류", "위험"]
 
 
-def write_log(msg):
-    try:
-        with open(LOG_PATH, "a", encoding="utf-8") as f:
-            f.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
-    except Exception:
-        pass
+# =========================================================================
+# 설정 파일 로드 / 저장
+# =========================================================================
+DEFAULT_CONFIG = {
+    "naver_client_id": "",
+    "naver_client_secret": "",
+    "ads_customer_id": "",
+    "ads_license_key": "",
+    "ads_secret_key": "",
+    "categories": DEFAULT_CATEGORIES,
+    "max_workers": 4,
+}
 
 
-def load_json(path, default):
-    if os.path.exists(path):
+def load_config():
+    cfg = dict(DEFAULT_CONFIG)
+    if os.path.exists(CONFIG_FILE):
         try:
-            with open(path, "r", encoding="utf-8") as f:
-                return json.load(f)
+            with open(CONFIG_FILE, "r", encoding="utf-8") as f:
+                saved = json.load(f)
+            cfg.update(saved)
         except Exception:
-            return default
-    return default
+            pass
+    return cfg
 
 
-def save_json(path, data):
+def save_config(cfg):
     try:
-        with open(path, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        write_log(f"저장 실패({path}): {e}")
+        with open(CONFIG_FILE, "w", encoding="utf-8") as f:
+            json.dump(cfg, f, ensure_ascii=False, indent=2)
+        return True
+    except Exception:
+        return False
 
 
-TITLE_TEMPLATES = [
-    ("SEO형", "{kw} 총정리 (최신 기준)"),
-    ("질문형", "{kw}, 지금 꼭 알아야 할까?"),
-    ("비교형", "{kw} vs 다른 방법, 무엇이 다를까"),
-    ("실수방지형", "{kw} 신청 전 이것 모르면 손해봅니다"),
-    ("후킹형", "{kw}, 오늘 아니면 늦을 수 있습니다"),
-    ("감성형", "{kw} 직접 알아보고 남긴 후기"),
-]
+# =========================================================================
+# 스크롤 가능한 프레임 (카드 리스트용)
+# =========================================================================
+class ScrollableFrame(ttk.Frame):
+    def __init__(self, parent, bg="#FFFFFF", *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.canvas = tk.Canvas(self, borderwidth=0, highlightthickness=0, bg=bg)
+        self.vbar = ttk.Scrollbar(self, orient="vertical", command=self.canvas.yview)
+        self.inner = tk.Frame(self.canvas, bg=bg)
+
+        self.inner.bind("<Configure>", self._on_inner_configure)
+        self.canvas_window = self.canvas.create_window((0, 0), window=self.inner, anchor="nw")
+        self.canvas.configure(yscrollcommand=self.vbar.set)
+
+        self.canvas.pack(side="left", fill="both", expand=True)
+        self.vbar.pack(side="right", fill="y")
+
+        self.canvas.bind("<Configure>", self._on_canvas_resize)
+        self.canvas.bind("<Enter>", lambda e: self.canvas.bind_all("<MouseWheel>", self._on_mousewheel))
+        self.canvas.bind("<Leave>", lambda e: self.canvas.unbind_all("<MouseWheel>"))
+
+    def _on_inner_configure(self, event):
+        self.canvas.configure(scrollregion=self.canvas.bbox("all"))
+
+    def _on_canvas_resize(self, event):
+        self.canvas.itemconfig(self.canvas_window, width=event.width)
+
+    def _on_mousewheel(self, event):
+        self.canvas.yview_scroll(int(-1 * (event.delta / 120)), "units")
+
+    def clear(self):
+        for w in self.inner.winfo_children():
+            w.destroy()
 
 
-def generate_titles(keyword):
-    return [(name, tpl.format(kw=keyword)) for name, tpl in TITLE_TEMPLATES]
+# =========================================================================
+# 접기/펼치기 설정 섹션
+# =========================================================================
+class CollapsibleSection(ttk.Frame):
+    def __init__(self, parent, title, start_expanded=False, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.title = title
+        self.expanded = start_expanded
+
+        header = ttk.Frame(self)
+        header.pack(fill="x")
+        self.toggle_btn = ttk.Button(header, text=self._label(), command=self.toggle)
+        self.toggle_btn.pack(fill="x")
+
+        self.body = ttk.Frame(self, padding=8)
+        if self.expanded:
+            self.body.pack(fill="x")
+
+    def _label(self):
+        arrow = "\u25BC" if self.expanded else "\u25B6"
+        return f"{arrow} {self.title}"
+
+    def toggle(self):
+        self.expanded = not self.expanded
+        if self.expanded:
+            self.body.pack(fill="x")
+        else:
+            self.body.pack_forget()
+        self.toggle_btn.config(text=self._label())
 
 
-def generate_outline(keyword, r):
-    lines = []
-    lines.append(f"1. {keyword}가 최근 이슈가 된 배경")
-    lines.append(f"2. {keyword} 핵심 정보 요약")
-    lines.append(f"3. {keyword} 관련 자주 묻는 질문")
-    lines.append(f"4. {keyword} 신청/확인 방법 (있는 경우)")
-    lines.append(f"5. 마무리 및 주의사항")
+# =========================================================================
+# 키워드 카드
+# =========================================================================
+class KeywordCard(tk.Frame):
+    def __init__(self, parent, data, on_click, *args, **kwargs):
+        style = GRADE_STYLE.get(data.get("grade", "보류"), GRADE_STYLE["보류"])
+        super().__init__(parent, bg=style["border"], *args, **kwargs)
+        self.data = data
+        self.on_click = on_click
+
+        self.pack_configure(fill="x", padx=8, pady=5)
+
+        card = tk.Frame(self, bg=style["bg"])
+        card.pack(fill="x", padx=1, pady=1)
+
+        # ---- 상단: 배지 / 순위 / 최종점수 ----
+        top_row = tk.Frame(card, bg=style["bg"])
+        top_row.pack(fill="x", padx=12, pady=(9, 3))
+
+        badge = tk.Label(top_row, text=style["label"], bg=style["badge_bg"], fg=style["badge_fg"],
+                          font=("맑은 고딕", 9, "bold"), padx=8, pady=2)
+        badge.pack(side="left")
+
+        rank = data.get("rank")
+        if rank:
+            tk.Label(top_row, text=f"#{rank}", bg=style["bg"], fg="#555555",
+                     font=("맑은 고딕", 9)).pack(side="left", padx=(8, 0))
+
+        tk.Label(top_row, text=f"FinalScore {data.get('final_score', 0):.1f}",
+                 bg=style["bg"], fg="#333333", font=("맑은 고딕", 9, "bold")).pack(side="right")
+
+        # ---- 키워드명 / 카테고리 ----
+        kw_row = tk.Frame(card, bg=style["bg"])
+        kw_row.pack(fill="x", padx=12, pady=(0, 4))
+        tk.Label(kw_row, text=data.get("keyword", ""), bg=style["bg"], fg="#111111",
+                 font=("맑은 고딕", 13, "bold")).pack(side="left")
+        tk.Label(kw_row, text=f"[{data.get('category', '-')}]", bg=style["bg"], fg="#777777",
+                 font=("맑은 고딕", 9)).pack(side="left", padx=(6, 0))
+
+        # ---- 지표 라인 ----
+        stat_row = tk.Frame(card, bg=style["bg"])
+        stat_row.pack(fill="x", padx=12, pady=(0, 4))
+        stat_text = (f"검색량 {data.get('search_volume', 0):,} · "
+                      f"문서수 {data.get('doc_count', 0):,} · "
+                      f"효율 {data.get('efficiency', 0):.2f} · "
+                      f"{data.get('timing', '상시')}")
+        tk.Label(stat_row, text=stat_text, bg=style["bg"], fg="#444444",
+                 font=("맑은 고딕", 9)).pack(side="left")
+
+        # ---- 위험/보류 사유 라인 (있을 때만) ----
+        reason = None
+        if data.get("grade") == "위험" and data.get("risk_reasons"):
+            reason = "위험 사유: " + ", ".join(data["risk_reasons"])
+        elif data.get("grade") == "보류" and data.get("hold_reasons"):
+            reason = "보류 사유: " + ", ".join(data["hold_reasons"])
+
+        if reason:
+            tk.Label(card, text=reason, bg=style["bg"], fg=style["border"],
+                     font=("맑은 고딕", 9, "italic"), wraplength=620,
+                     justify="left", anchor="w").pack(fill="x", padx=12, pady=(0, 9), anchor="w")
+        else:
+            tk.Frame(card, bg=style["bg"], height=6).pack()
+
+        # 카드 전체 클릭 가능하게 바인딩
+        clickable = [self, card, top_row, kw_row, stat_row]
+        for w in clickable:
+            w.bind("<Button-1>", self._click)
+            w.configure(cursor="hand2")
+        for w in card.winfo_children():
+            self._bind_children(w)
+
+    def _bind_children(self, widget):
+        widget.bind("<Button-1>", self._click)
+        widget.configure(cursor="hand2")
+        for c in widget.winfo_children():
+            self._bind_children(c)
+
+    def _click(self, event=None):
+        self.on_click(self.data)
+
+
+# =========================================================================
+# 상세 분석 패널
+# =========================================================================
+class DetailPanel(ttk.Frame):
+    def __init__(self, parent, on_generate_draft, *args, **kwargs):
+        super().__init__(parent, *args, **kwargs)
+        self.on_generate_draft = on_generate_draft
+        self.data = None
+
+        ttk.Label(self, text="상세 분석", font=("맑은 고딕", 12, "bold")).pack(anchor="w", pady=(0, 6))
+
+        self.body = scrolledtext.ScrolledText(self, wrap="word", height=18, font=("맑은 고딕", 10))
+        self.body.pack(fill="both", expand=True)
+        self.body.configure(state="disabled")
+
+        btn_row = ttk.Frame(self)
+        btn_row.pack(fill="x", pady=8)
+        ttk.Button(btn_row, text="글초안 생성", command=self._draft).pack(side="left")
+        ttk.Button(btn_row, text="복사", command=self._copy).pack(side="left", padx=(6, 0))
+
+    def _set_text(self, text):
+        self.body.configure(state="normal")
+        self.body.delete("1.0", "end")
+        self.body.insert("1.0", text)
+        self.body.configure(state="disabled")
+
+    def show(self, data):
+        self.data = data
+        style = GRADE_STYLE.get(data.get("grade", "보류"), GRADE_STYLE["보류"])
+
+        checks = {
+            "뉴스 언급": data.get("verify_news", data.get("mentions", 0) > 0),
+            "검색량 확보": data.get("verify_volume", data.get("search_volume", 0) > 0),
+            "문서수 확보": data.get("verify_docs", data.get("doc_count", 0) > 0),
+            "DataLab 상승률": data.get("verify_datalab", False),
+        }
+        check_lines = []
+        for name, ok in checks.items():
+            mark = "✔" if ok else "✘"
+            check_lines.append(f"  {mark} {name}")
+
+        lines = []
+        lines.append(f"[{style['label']}]  {data.get('keyword', '')}")
+        lines.append(f"카테고리: {data.get('category', '-')}   순위: {data.get('rank', '-')}")
+        lines.append("")
+        lines.append("=== 4단계 교차검증 ===")
+        lines.extend(check_lines)
+        lines.append("")
+        lines.append("=== 점수 산출 ===")
+        lines.append(f"IssueScore      : {data.get('issue_score', 0):.2f}")
+        lines.append(f"OpportunityScore: {data.get('opportunity_score', 0):.2f}")
+        lines.append(f"CategoryWeight  : {data.get('category_weight', 1.0):.2f}")
+        lines.append(f"FinalScore      : {data.get('final_score', 0):.2f}")
+        lines.append("")
+        lines.append("=== 실측 지표 ===")
+        lines.append(f"뉴스 언급 수 : {data.get('mentions', 0):,}")
+        lines.append(f"검색량       : {data.get('search_volume', 0):,}")
+        lines.append(f"문서수       : {data.get('doc_count', 0):,}")
+        lines.append(f"검색량/문서수 효율 : {data.get('efficiency', 0):.2f}")
+        lines.append(f"작성 타이밍  : {data.get('timing', '상시')}")
+
+        if data.get("risk_reasons"):
+            lines.append("")
+            lines.append("=== 위험 사유 ===")
+            for r in data["risk_reasons"]:
+                lines.append(f"  - {r}")
+        if data.get("hold_reasons"):
+            lines.append("")
+            lines.append("=== 보류 사유 ===")
+            for r in data["hold_reasons"]:
+                lines.append(f"  - {r}")
+
+        self._set_text("\n".join(lines))
+
+    def _draft(self):
+        if not self.data:
+            return
+        draft = self.on_generate_draft(self.data)
+        self._set_text(draft)
+
+    def _copy(self):
+        content = self.body.get("1.0", "end")
+        self.clipboard_clear()
+        self.clipboard_append(content)
+
+
+def generate_draft_text(data):
+    """외부 AI API 없이 템플릿 기반으로 글초안 뼈대를 생성."""
+    kw = data.get("keyword", "")
+    cat = data.get("category", "")
+    timing = data.get("timing", "상시")
+    lines = [
+        f"[글초안] {kw}",
+        "",
+        f"■ 카테고리: {cat}   ■ 작성 타이밍: {timing}",
+        "",
+        "1. 제목 후보",
+        f"   - {kw}, 놓치면 후회하는 이유",
+        f"   - {kw} 조건 및 신청 방법 총정리",
+        f"   - 2026년 {kw} 최신 정보",
+        "",
+        "2. 서론",
+        f"   {kw}에 대한 관심이 높아지고 있는 배경과, 이 글에서 다룰 핵심 내용을 간단히 소개합니다.",
+        "",
+        "3. 본문 목차",
+        f"   - {kw}란 무엇인가",
+        f"   - {kw} 대상 및 조건",
+        f"   - {kw} 신청/이용 방법",
+        f"   - 주의할 점 및 자주 묻는 질문",
+        "",
+        "4. 결론",
+        f"   {kw} 관련 핵심 요약과 행동 유도(신청 링크, 관련 글 안내 등)를 마무리합니다.",
+        "",
+        f"※ 검색량 {data.get('search_volume', 0):,} / 문서수 {data.get('doc_count', 0):,} "
+        f"/ 효율 {data.get('efficiency', 0):.2f} 기준으로 산출된 초안입니다.",
+    ]
     return "\n".join(lines)
 
 
-def generate_faq(keyword):
-    faqs = [
-        (f"{keyword}는 누구나 해당되나요?", "대상 조건에 따라 다르므로 최신 공고를 함께 확인하는 것이 좋습니다."),
-        (f"{keyword} 신청 기한은 언제까지인가요?", "관련 기관 공지에 따라 변경될 수 있어 최신 일정을 확인해야 합니다."),
-        (f"{keyword} 관련 주의할 점이 있나요?", "과장 광고나 사칭 사이트에 유의하고 공식 채널을 통해 확인하는 것이 안전합니다."),
-    ]
-    return faqs
+# =========================================================================
+# 메인 애플리케이션
+# =========================================================================
+class App(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title(f"{APP_TITLE} {APP_VERSION}")
+        self.geometry("1360x860")
+        self.minsize(1100, 700)
 
-
-def generate_tags(keyword, r):
-    tags = [keyword, "2026", "최신정보"]
-    if r.get("generic_flag"):
-        tags.append("생활정보")
-    if r.get("spike_ratio") and r["spike_ratio"] >= 1.3:
-        tags.append("급상승이슈")
-    return tags
-
-
-class ScrollableText(tk.Frame):
-    def __init__(self, master, height=10, **kw):
-        super().__init__(master, bg=COLOR_CARD)
-        self.text = tk.Text(self, height=height, wrap="word", bg=COLOR_CARD,
-                             relief="flat", font=(FONT_FAMILY, 10), **kw)
-        sb = ttk.Scrollbar(self, command=self.text.yview)
-        self.text.configure(yscrollcommand=sb.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        sb.pack(side="right", fill="y")
-
-    def set_text(self, content):
-        self.text.configure(state="normal")
-        self.text.delete("1.0", "end")
-        self.text.insert("1.0", content)
-        self.text.configure(state="disabled")
-
-    def get_text(self):
-        return self.text.get("1.0", "end").strip()
-
-
-class App:
-    def __init__(self, root):
-        self.root = root
-        self.root.title("수익형 키워드 발굴기 v17.2")
-        self.root.geometry("1440x900")
-        self.root.configure(bg=COLOR_BG)
-
-        self.config_data = load_json(CONFIG_PATH, {})
-        self.status_data = load_json(STATUS_PATH, {})
+        self.cfg = load_config()
         self.results = []
-        self.selected_kw = None
-        self.settings_visible = False
+        self.current_filter = "전체"
+        self.search_var = tk.StringVar()
+        self.queue = queue.Queue()
+        self.worker_thread = None
 
-        self._setup_style()
-        self._build_header()
-        self._build_settings_panel()
-        self._build_cards()
-        self._build_progress()
-        self._build_main_panels()
-        self._build_queue_panel()
+        self._build_style()
+        self._build_layout()
+        self._poll_queue()
 
-        self._load_config_to_entries()
-
-    # ---------------- style ----------------
-    def _setup_style(self):
-        style = ttk.Style()
+    # ---------------------------------------------------------------
+    def _build_style(self):
+        style = ttk.Style(self)
         try:
-            style.theme_use("clam")
+            style.theme_use("vista")
         except Exception:
             pass
-        style.configure("TButton", font=(FONT_FAMILY, 10), padding=6)
-        style.configure("Blue.TButton", background=COLOR_BLUE, foreground="white")
-        style.map("Blue.TButton", background=[("active", "#1E56C4")])
-        style.configure("Treeview", font=(FONT_FAMILY, 10), rowheight=24)
-        style.configure("Treeview.Heading", font=(FONT_FAMILY, 10, "bold"))
 
-    # ---------------- header ----------------
-    def _build_header(self):
-        header = tk.Frame(self.root, bg=COLOR_NAVY, height=54)
-        header.pack(fill="x", side="top")
-        tk.Label(header, text="수익형 키워드 발굴기 v17.2", bg=COLOR_NAVY, fg="white",
-                 font=(FONT_FAMILY, 14, "bold")).pack(side="left", padx=16, pady=10)
+    # ---------------------------------------------------------------
+    def _build_layout(self):
+        # 상단 툴바
+        top = ttk.Frame(self, padding=10)
+        top.pack(fill="x")
 
-        btn_frame = tk.Frame(header, bg=COLOR_NAVY)
-        btn_frame.pack(side="right", padx=12)
-        ttk.Button(btn_frame, text="⚙ 설정", command=self._toggle_settings).pack(side="right", padx=4)
-        ttk.Button(btn_frame, text="▶ 오늘 분석 시작", style="Blue.TButton",
-                   command=self.start_analysis).pack(side="right", padx=4)
+        ttk.Label(top, text=APP_TITLE, font=("맑은 고딕", 14, "bold")).pack(side="left")
+        ttk.Label(top, text=APP_VERSION, foreground="#888888").pack(side="left", padx=(6, 0))
 
-    # ---------------- settings ----------------
-    def _build_settings_panel(self):
-        self.settings_outer = tk.Frame(self.root, bg=COLOR_BG)
-        self.settings_frame = tk.Frame(self.settings_outer, bg=COLOR_CARD, bd=1, relief="solid")
+        self.run_btn = ttk.Button(top, text="\u25B6 오늘 분석 시작", command=self._start_analysis)
+        self.run_btn.pack(side="right")
 
-        def group(parent, title):
-            f = tk.LabelFrame(parent, text=title, bg=COLOR_CARD, font=(FONT_FAMILY, 10, "bold"), padx=10, pady=8)
-            return f
+        self.settings_toggle_btn = ttk.Button(top, text="API 설정", command=self._toggle_settings)
+        self.settings_toggle_btn.pack(side="right", padx=(0, 8))
 
-        row = tk.Frame(self.settings_frame, bg=COLOR_CARD)
-        row.pack(fill="x", padx=10, pady=8)
+        ttk.Button(top, text="CSV 내보내기", command=self._export_csv).pack(side="right", padx=(0, 8))
 
-        # 1) 검색 API
-        g1 = group(row, "① 네이버 검색 API (뉴스/블로그/문서수)")
-        g1.pack(side="left", fill="both", expand=True, padx=5)
-        tk.Label(g1, text="Client ID", bg=COLOR_CARD).grid(row=0, column=0, sticky="w")
-        self.e_search_id = ttk.Entry(g1, width=28)
-        self.e_search_id.grid(row=0, column=1, pady=2)
-        tk.Label(g1, text="Client Secret", bg=COLOR_CARD).grid(row=1, column=0, sticky="w")
-        self.e_search_secret = ttk.Entry(g1, width=28, show="*")
-        self.e_search_secret.grid(row=1, column=1, pady=2)
-        ttk.Button(g1, text="네이버 검색 API 연결 테스트",
-                   command=self.test_search_api).grid(row=2, column=0, columnspan=2, pady=6, sticky="we")
-        self.lbl_search_result = tk.Label(g1, text="", bg=COLOR_CARD, wraplength=260, justify="left")
-        self.lbl_search_result.grid(row=3, column=0, columnspan=2, sticky="w")
+        # 설정 패널 (기본 접힘)
+        self.settings_frame = ttk.Frame(self, padding=(10, 0, 10, 10))
+        self._build_settings_panel(self.settings_frame)
+        self.settings_visible = False
 
-        # 2) 데이터랩
-        g2 = group(row, "② 네이버 데이터랩 (검색어트렌드)")
-        g2.pack(side="left", fill="both", expand=True, padx=5)
-        tk.Label(g2, text="Client ID", bg=COLOR_CARD).grid(row=0, column=0, sticky="w")
-        self.e_dl_id = ttk.Entry(g2, width=28)
-        self.e_dl_id.grid(row=0, column=1, pady=2)
-        tk.Label(g2, text="Client Secret", bg=COLOR_CARD).grid(row=1, column=0, sticky="w")
-        self.e_dl_secret = ttk.Entry(g2, width=28, show="*")
-        self.e_dl_secret.grid(row=1, column=1, pady=2)
-        ttk.Button(g2, text="검색 API 값 복사", command=self._copy_search_to_datalab).grid(
-            row=2, column=0, columnspan=2, pady=2, sticky="we")
-        ttk.Button(g2, text="데이터랩 연결 테스트",
-                   command=self.test_datalab_api).grid(row=3, column=0, columnspan=2, pady=4, sticky="we")
-        self.lbl_dl_result = tk.Label(g2, text="", bg=COLOR_CARD, wraplength=260, justify="left")
-        self.lbl_dl_result.grid(row=4, column=0, columnspan=2, sticky="w")
+        # 진행률 바
+        self.progress = ttk.Progressbar(self, mode="indeterminate")
 
-        # 3) 검색광고 API
-        g3 = group(row, "③ 네이버 검색광고 API (검색량/경쟁도)")
-        g3.pack(side="left", fill="both", expand=True, padx=5)
-        tk.Label(g3, text="Customer ID(숫자)", bg=COLOR_CARD).grid(row=0, column=0, sticky="w")
-        self.e_ads_customer = ttk.Entry(g3, width=28)
-        self.e_ads_customer.grid(row=0, column=1, pady=2)
-        tk.Label(g3, text="License Key", bg=COLOR_CARD).grid(row=1, column=0, sticky="w")
-        self.e_ads_license = ttk.Entry(g3, width=28)
-        self.e_ads_license.grid(row=1, column=1, pady=2)
-        tk.Label(g3, text="Secret Key", bg=COLOR_CARD).grid(row=2, column=0, sticky="w")
-        self.e_ads_secret = ttk.Entry(g3, width=28, show="*")
-        self.e_ads_secret.grid(row=2, column=1, pady=2)
-        ttk.Button(g3, text="검색광고 API 연결 테스트",
-                   command=self.test_ads_api).grid(row=3, column=0, columnspan=2, pady=6, sticky="we")
-        self.lbl_ads_result = tk.Label(g3, text="", bg=COLOR_CARD, wraplength=260, justify="left")
-        self.lbl_ads_result.grid(row=4, column=0, columnspan=2, sticky="w")
+        # 필터 칩 바
+        filter_bar = ttk.Frame(self, padding=(10, 4, 10, 4))
+        filter_bar.pack(fill="x")
+        self.filter_buttons = {}
+        for label in ["전체"] + GRADE_ORDER:
+            btn = ttk.Button(filter_bar, text=label, command=lambda l=label: self._apply_filter(l))
+            btn.pack(side="left", padx=4)
+            self.filter_buttons[label] = btn
 
-        ttk.Button(self.settings_frame, text="설정 저장", style="Blue.TButton",
-                   command=self._save_config_from_entries).pack(pady=8)
+        ttk.Label(filter_bar, text="검색:").pack(side="left", padx=(16, 4))
+        search_entry = ttk.Entry(filter_bar, textvariable=self.search_var, width=20)
+        search_entry.pack(side="left")
+        search_entry.bind("<KeyRelease>", lambda e: self._render_cards())
+
+        self.summary_label = ttk.Label(filter_bar, text="", foreground="#555555")
+        self.summary_label.pack(side="right")
+
+        # 본문: 좌(카드 리스트) / 우(상세 패널)
+        body = ttk.Frame(self)
+        body.pack(fill="both", expand=True, padx=10, pady=(0, 10))
+
+        left = ttk.Frame(body)
+        left.pack(side="left", fill="both", expand=True)
+        self.card_area = ScrollableFrame(left, bg="#FAFAFA")
+        self.card_area.pack(fill="both", expand=True)
+
+        right = ttk.Frame(body, width=420)
+        right.pack(side="right", fill="y", padx=(10, 0))
+        self.detail_panel = DetailPanel(right, on_generate_draft=generate_draft_text)
+        self.detail_panel.pack(fill="both", expand=True)
+
+        # 로그 영역 (하단, 접기/펼치기)
+        self.log_section = CollapsibleSection(self, "실행 로그", start_expanded=False)
+        self.log_section.pack(fill="x", padx=10, pady=(0, 10))
+        self.log_text = scrolledtext.ScrolledText(self.log_section.body, height=8, font=("Consolas", 9))
+        self.log_text.pack(fill="both", expand=True)
+
+    # ---------------------------------------------------------------
+    def _build_settings_panel(self, parent):
+        self.entries = {}
+
+        sec_search = CollapsibleSection(parent, "① 검색/데이터랩 API (developers.naver.com)", start_expanded=True)
+        sec_search.pack(fill="x", pady=4)
+        self._add_field(sec_search.body, "Client ID", "naver_client_id")
+        self._add_field(sec_search.body, "Client Secret", "naver_client_secret", secret=True)
+        ttk.Button(sec_search.body, text="검색 API 연결 테스트",
+                   command=self._test_search_api).grid(row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Button(sec_search.body, text="데이터랩 API 연결 테스트",
+                   command=self._test_datalab_api).grid(row=2, column=1, sticky="w", pady=(6, 0))
+
+        sec_ads = CollapsibleSection(parent, "② 검색광고 API (searchad.naver.com)", start_expanded=True)
+        sec_ads.pack(fill="x", pady=4)
+        self._add_field(sec_ads.body, "Customer ID", "ads_customer_id")
+        self._add_field(sec_ads.body, "License Key(엑세스라이선스)", "ads_license_key")
+        self._add_field(sec_ads.body, "Secret Key(비밀키)", "ads_secret_key", secret=True)
+        ttk.Button(sec_ads.body, text="검색광고 API 연결 테스트",
+                   command=self._test_ads_api).grid(row=3, column=0, sticky="w", pady=(6, 0))
+
+        sec_cat = CollapsibleSection(parent, "③ 수익형 카테고리 선택", start_expanded=True)
+        sec_cat.pack(fill="x", pady=4)
+        self.category_vars = {}
+        cats = self.cfg.get("categories", DEFAULT_CATEGORIES)
+        for i, cat in enumerate(DEFAULT_CATEGORIES):
+            var = tk.BooleanVar(value=(cat in cats))
+            cb = ttk.Checkbutton(sec_cat.body, text=cat, variable=var)
+            cb.grid(row=i // 4, column=i % 4, sticky="w", padx=6, pady=2)
+            self.category_vars[cat] = var
+
+        ttk.Button(parent, text="설정 저장", command=self._save_settings).pack(anchor="e", pady=(8, 0))
+
+    def _add_field(self, parent, label, key, secret=False):
+        row = len(self.entries)
+        ttk.Label(parent, text=label).grid(row=row, column=0, sticky="w", padx=(0, 6), pady=2)
+        var = tk.StringVar(value=self.cfg.get(key, ""))
+        entry = ttk.Entry(parent, textvariable=var, width=42, show="*" if secret else "")
+        entry.grid(row=row, column=1, sticky="w", pady=2)
+        self.entries[key] = var
 
     def _toggle_settings(self):
         if self.settings_visible:
-            self.settings_outer.pack_forget()
-            self.settings_visible = False
+            self.settings_frame.pack_forget()
         else:
-            self.settings_outer.pack(fill="x", side="top", padx=10, pady=6, before=self.cards_frame)
-            self.settings_frame.pack(fill="x")
-            self.settings_visible = True
+            self.settings_frame.pack(fill="x", after=self.children[list(self.children)[0]])
+        self.settings_visible = not self.settings_visible
 
-    def _copy_search_to_datalab(self):
-        self.e_dl_id.delete(0, "end")
-        self.e_dl_id.insert(0, self.e_search_id.get())
-        self.e_dl_secret.delete(0, "end")
-        self.e_dl_secret.insert(0, self.e_search_secret.get())
-
-    def _load_config_to_entries(self):
-        c = self.config_data
-        self.e_search_id.insert(0, c.get("search_client_id", ""))
-        self.e_search_secret.insert(0, c.get("search_client_secret", ""))
-        self.e_dl_id.insert(0, c.get("datalab_client_id", ""))
-        self.e_dl_secret.insert(0, c.get("datalab_client_secret", ""))
-        self.e_ads_customer.insert(0, c.get("ads_customer_id", ""))
-        self.e_ads_license.insert(0, c.get("ads_license_key", ""))
-        self.e_ads_secret.insert(0, c.get("ads_secret_key", ""))
-
-    def _save_config_from_entries(self):
-        self.config_data = {
-            "search_client_id": self.e_search_id.get().strip(),
-            "search_client_secret": self.e_search_secret.get().strip(),
-            "datalab_client_id": self.e_dl_id.get().strip(),
-            "datalab_client_secret": self.e_dl_secret.get().strip(),
-            "ads_customer_id": self.e_ads_customer.get().strip(),
-            "ads_license_key": self.e_ads_license.get().strip(),
-            "ads_secret_key": self.e_ads_secret.get().strip(),
-        }
-        save_json(CONFIG_PATH, self.config_data)
-        messagebox.showinfo("저장 완료", "API 설정이 저장되었습니다.")
-
-    def _get_search_api(self):
-        return NaverSearchAPI(self.e_search_id.get().strip(), self.e_search_secret.get().strip())
-
-    def _get_datalab_api(self):
-        return NaverDataLabAPI(self.e_dl_id.get().strip(), self.e_dl_secret.get().strip())
-
-    def _get_ads_api(self):
-        return NaverAdsAPI(self.e_ads_customer.get().strip(), self.e_ads_license.get().strip(),
-                           self.e_ads_secret.get().strip())
-
-    def test_search_api(self):
-        def run():
-            ok, msg, warn = self._get_search_api().test_connection()
-            text = msg + ("\n" + warn if warn else "")
-            self.root.after(0, lambda: self.lbl_search_result.configure(
-                text=text, fg=COLOR_GREEN if ok else COLOR_RED))
-        threading.Thread(target=run, daemon=True).start()
-
-    def test_datalab_api(self):
-        def run():
-            ok, msg, warn = self._get_datalab_api().test_connection()
-            text = msg + ("\n" + warn if warn else "")
-            self.root.after(0, lambda: self.lbl_dl_result.configure(
-                text=text, fg=COLOR_GREEN if ok else COLOR_RED))
-        threading.Thread(target=run, daemon=True).start()
-
-    def test_ads_api(self):
-        def run():
-            ok, msg, warn = self._get_ads_api().test_connection()
-            text = msg + ("\n" + warn if warn else "")
-            self.root.after(0, lambda: self.lbl_ads_result.configure(
-                text=text, fg=COLOR_GREEN if ok else COLOR_RED))
-        threading.Thread(target=run, daemon=True).start()
-
-    # ---------------- cards ----------------
-    def _build_cards(self):
-        self.cards_frame = tk.Frame(self.root, bg=COLOR_BG)
-        self.cards_frame.pack(fill="x", padx=10, pady=(10, 4))
-        self.card_vars = {}
-        labels = ["검증 완료 키워드", "TOP5 추천", "TOP10 후보", "보류", "위험 키워드", "마지막 실행"]
-        for lb in labels:
-            card = tk.Frame(self.cards_frame, bg=COLOR_CARD, bd=0, highlightbackground="#DDE1E8",
-                             highlightthickness=1)
-            card.pack(side="left", fill="both", expand=True, padx=5)
-            tk.Label(card, text=lb, bg=COLOR_CARD, fg=COLOR_GRAY, font=(FONT_FAMILY, 9)).pack(
-                anchor="w", padx=12, pady=(10, 0))
-            var = tk.StringVar(value="0")
-            tk.Label(card, textvariable=var, bg=COLOR_CARD, fg=COLOR_NAVY,
-                     font=(FONT_FAMILY, 20, "bold")).pack(anchor="w", padx=12, pady=(0, 10))
-            self.card_vars[lb] = var
-
-    def _update_cards(self):
-        verified = sum(1 for r in self.results if r["doc_status"] == "검증 완료"
-                       or r["search_status"] == "검증 완료" or r["datalab_status"] == "검증 완료")
-        top5 = sum(1 for r in self.results if r["grade"] == "TOP5")
-        top10 = sum(1 for r in self.results if r["grade"] == "TOP10")
-        hold = sum(1 for r in self.results if r["grade"] == "보류")
-        risk = sum(1 for r in self.results if r["grade"] == "위험")
-        self.card_vars["검증 완료 키워드"].set(str(verified))
-        self.card_vars["TOP5 추천"].set(str(top5))
-        self.card_vars["TOP10 후보"].set(str(top10))
-        self.card_vars["보류"].set(str(hold))
-        self.card_vars["위험 키워드"].set(str(risk))
-        self.card_vars["마지막 실행"].set(time.strftime("%H:%M:%S"))
-
-    # ---------------- progress ----------------
-    def _build_progress(self):
-        f = tk.Frame(self.root, bg=COLOR_BG)
-        f.pack(fill="x", padx=10, pady=(0, 6))
-        self.progress = ttk.Progressbar(f, mode="determinate")
-        self.progress.pack(side="left", fill="x", expand=True, padx=(0, 8))
-        self.status_var = tk.StringVar(value="대기 중")
-        tk.Label(f, textvariable=self.status_var, bg=COLOR_BG, fg=COLOR_NAVY).pack(side="right")
-
-    # ---------------- main 3-split ----------------
-    def _build_main_panels(self):
-        main = ttk.PanedWindow(self.root, orient="horizontal")
-        main.pack(fill="both", expand=True, padx=10, pady=(0, 6))
-
-        # 왼쪽: TOP30 목록
-        left = tk.Frame(main, bg=COLOR_CARD)
-        main.add(left, weight=45)
-
-        tk.Label(left, text="TOP30 키워드", bg=COLOR_CARD, font=(FONT_FAMILY, 11, "bold")).pack(
-            anchor="w", padx=8, pady=6)
-        cols = ("rank", "keyword", "grade", "score", "risk")
-        self.tree = ttk.Treeview(left, columns=cols, show="headings", height=25)
-        headers = {"rank": "순위", "keyword": "키워드", "grade": "등급", "score": "점수", "risk": "위험/보류 사유"}
-        widths = {"rank": 40, "keyword": 170, "grade": 55, "score": 55, "risk": 230}
-        for c in cols:
-            self.tree.heading(c, text=headers[c])
-            self.tree.column(c, width=widths[c], anchor="center")
-        self.tree.tag_configure("top5", foreground=COLOR_GREEN)
-        self.tree.tag_configure("top10", foreground=COLOR_BLUE)
-        self.tree.tag_configure("risk", foreground=COLOR_RED)
-        self.tree.tag_configure("hold", foreground=COLOR_ORANGE)
-        vs = ttk.Scrollbar(left, command=self.tree.yview)
-        self.tree.configure(yscrollcommand=vs.set)
-        self.tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
-        vs.pack(side="right", fill="y")
-        self.tree.bind("<<TreeviewSelect>>", self._on_select_keyword)
-
-        # 오른쪽: 위(상세분석) / 아래(글초안)
-        right = ttk.PanedWindow(main, orient="vertical")
-        main.add(right, weight=55)
-
-        detail = tk.Frame(right, bg=COLOR_CARD)
-        right.add(detail, weight=45)
-        tk.Label(detail, text="선택 키워드 분석", bg=COLOR_CARD, font=(FONT_FAMILY, 11, "bold")).pack(
-            anchor="w", padx=8, pady=6)
-        self.detail_text = ScrollableText(detail, height=14)
-        self.detail_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-        draft = tk.Frame(right, bg=COLOR_CARD)
-        right.add(draft, weight=55)
-        top_bar = tk.Frame(draft, bg=COLOR_CARD)
-        top_bar.pack(fill="x", padx=8, pady=6)
-        tk.Label(top_bar, text="글 초안 (제목 / 개요 / FAQ / 태그)", bg=COLOR_CARD,
-                 font=(FONT_FAMILY, 11, "bold")).pack(side="left")
-        ttk.Button(top_bar, text="클립보드 복사", command=self.copy_draft_to_clipboard).pack(side="right", padx=2)
-        ttk.Button(top_bar, text="TXT 저장", command=self.save_draft_txt).pack(side="right", padx=2)
-        ttk.Button(top_bar, text="큐에 추가", style="Blue.TButton", command=self.add_selected_to_queue).pack(
-            side="right", padx=2)
-        self.draft_text = ScrollableText(draft, height=16)
-        self.draft_text.pack(fill="both", expand=True, padx=8, pady=(0, 8))
-
-    def _on_select_keyword(self, event):
-        sel = self.tree.selection()
-        if not sel:
-            return
-        idx = int(sel[0])
-        r = self.results[idx]
-        self.selected_kw = r
-        self._render_detail(r)
-        self._render_draft(r)
-
-    def _render_detail(self, r):
-        lines = []
-        lines.append(f"■ 키워드: {r['keyword']}   [{r['grade']}]  최종점수 {r['final_score']}")
-        lines.append("")
-        lines.append(f"- 검색량: {r['search_volume'] if r['search_volume'] is not None else r['search_status']}"
-                     + (f" ({r['search_error']})" if r.get("search_error") else ""))
-        lines.append(f"- 문서수: {r['doc_count'] if r['doc_count'] is not None else r['doc_status']}"
-                     + (f" ({r['doc_error']})" if r.get("doc_error") else ""))
-        lines.append(f"- 경쟁도: {r.get('comp_idx') or '-'}")
-        lines.append(f"- DataLab 상승률: {r['spike_ratio'] if r['spike_ratio'] is not None else r['datalab_status']}"
-                     + (f" ({r['datalab_error']})" if r.get("datalab_error") else ""))
-        lines.append(f"- 뉴스 언급: {r.get('news_count', 0)}건")
-        lines.append(f"- 효율(검색량/문서수): {r['efficiency']:.2f}" if r.get("efficiency") else "- 효율: 산출 불가")
-        lines.append(f"- 추정 월수익(참고용): {r['estimated_revenue_won']:,}원" if r.get("estimated_revenue_won") else "- 추정 월수익: 산출 불가")
-        lines.append("")
-        lines.append("[위험 사유] - 범용/상시성 키워드일 때만 표시")
-        if r.get("risk_reasons"):
-            for reason in r["risk_reasons"]:
-                lines.append(f"  ! {reason}")
+    def _save_settings(self):
+        for key, var in self.entries.items():
+            self.cfg[key] = var.get().strip()
+        self.cfg["categories"] = [c for c, v in self.category_vars.items() if v.get()]
+        if save_config(self.cfg):
+            messagebox.showinfo("저장 완료", "설정이 저장되었습니다.")
         else:
-            lines.append("  - 없음")
-        lines.append("")
-        lines.append("[보류(우선순위 하락) 사유] - 위험은 아니지만 오늘 우선순위가 낮은 이유")
-        if r.get("hold_reasons"):
-            for reason in r["hold_reasons"]:
-                lines.append(f"  · {reason}")
-        else:
-            lines.append("  - 없음")
-        lines.append("")
-        lines.append("[추천 이유 태그]")
-        for tag in r.get("recommend_tags", []):
-            lines.append(f"  ✓ {tag}")
-        lines.append("")
-        lines.append("[참고 기사]")
-        lines.append(f"  {r.get('sample_title', '-')}")
-        lines.append(f"  {r.get('sample_link', '-')}")
-        self.detail_text.set_text("\n".join(lines))
+            messagebox.showerror("저장 실패", "설정 파일 저장에 실패했습니다.")
 
-    def _render_draft(self, r):
-        kw = r["keyword"]
-        lines = []
-        lines.append("[제목 6유형]")
-        for name, title in generate_titles(kw):
-            lines.append(f"  ({name}) {title}")
-        lines.append("")
-        lines.append("[글 개요]")
-        lines.append(generate_outline(kw, r))
-        lines.append("")
-        lines.append("[FAQ]")
-        for q, a in generate_faq(kw):
-            lines.append(f"  Q. {q}")
-            lines.append(f"  A. {a}")
-        lines.append("")
-        lines.append("[추천 태그]")
-        lines.append("  " + ", ".join(generate_tags(kw, r)))
-        self.draft_text.set_text("\n".join(lines))
+    # ---- 연결 테스트 -------------------------------------------------
+    def _test_search_api(self):
+        self._save_settings()
+        api = NaverSearchAPI(self.cfg["naver_client_id"], self.cfg["naver_client_secret"])
+        ok, msg = api.test_connection()
+        (messagebox.showinfo if ok else messagebox.showerror)("검색 API 테스트", msg)
 
-    def copy_draft_to_clipboard(self):
-        text = self.draft_text.get_text()
-        self.root.clipboard_clear()
-        self.root.clipboard_append(text)
-        messagebox.showinfo("복사 완료", "글 초안이 클립보드에 복사되었습니다.")
+    def _test_datalab_api(self):
+        self._save_settings()
+        api = NaverDataLabAPI(self.cfg["naver_client_id"], self.cfg["naver_client_secret"])
+        ok, msg = api.test_connection()
+        (messagebox.showinfo if ok else messagebox.showerror)("데이터랩 API 테스트", msg)
 
-    def save_draft_txt(self):
-        if not self.selected_kw:
-            return
-        kw = self.selected_kw["keyword"]
-        path = os.path.join(APP_DIR, f"draft_{kw.replace(' ', '_')}.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(self.draft_text.get_text())
-        messagebox.showinfo("저장 완료", f"{path} 에 저장되었습니다.")
+    def _test_ads_api(self):
+        self._save_settings()
+        api = NaverAdsAPI(self.cfg["ads_customer_id"], self.cfg["ads_license_key"], self.cfg["ads_secret_key"])
+        ok, msg = api.test_connection()
+        (messagebox.showinfo if ok else messagebox.showerror)("검색광고 API 테스트", msg)
 
-    # ---------------- 작성 큐 ----------------
-    def _build_queue_panel(self):
-        outer = tk.Frame(self.root, bg=COLOR_CARD, height=170, highlightbackground="#DDE1E8",
-                         highlightthickness=1)
-        outer.pack(fill="x", padx=10, pady=(0, 10))
-
-        top = tk.Frame(outer, bg=COLOR_CARD)
-        top.pack(fill="x", padx=8, pady=6)
-        tk.Label(top, text="오늘의 TOP5 작성 큐", bg=COLOR_CARD, font=(FONT_FAMILY, 11, "bold")).pack(side="left")
-        ttk.Button(top, text="작성 시작", command=lambda: self._set_queue_status("작성중")).pack(side="right", padx=2)
-        ttk.Button(top, text="작성완료", command=lambda: self._set_queue_status("작성완료")).pack(side="right", padx=2)
-        ttk.Button(top, text="발행완료", command=lambda: self._set_queue_status("발행완료")).pack(side="right", padx=2)
-        ttk.Button(top, text="CSV 저장", command=self.export_csv).pack(side="right", padx=8)
-        ttk.Button(top, text="TXT 저장(전체)", command=self.export_txt_all).pack(side="right", padx=2)
-
-        cols = ("keyword", "grade", "status")
-        self.queue_tree = ttk.Treeview(outer, columns=cols, show="headings", height=5)
-        for c, t, w in [("keyword", "키워드", 220), ("grade", "등급", 80), ("status", "상태", 100)]:
-            self.queue_tree.heading(c, text=t)
-            self.queue_tree.column(c, width=w, anchor="center")
-        self.queue_tree.pack(fill="x", padx=8, pady=(0, 8))
-
-    def add_selected_to_queue(self):
-        if not self.selected_kw:
-            return
-        kw = self.selected_kw["keyword"]
-        if kw not in self.status_data:
-            self.status_data[kw] = "미작성"
-        save_json(STATUS_PATH, self.status_data)
-        self._refresh_queue_tree()
-
-    def _refresh_queue_tree(self):
-        self.queue_tree.delete(*self.queue_tree.get_children())
-        grade_map = {r["keyword"]: r["grade"] for r in self.results}
-        for kw, status in self.status_data.items():
-            self.queue_tree.insert("", "end", iid=kw, values=(kw, grade_map.get(kw, "-"), status))
-
-    def _set_queue_status(self, status):
-        sel = self.queue_tree.selection()
-        if not sel:
-            messagebox.showwarning("선택 필요", "큐에서 키워드를 먼저 선택하세요.")
-            return
-        kw = sel[0]
-        self.status_data[kw] = status
-        save_json(STATUS_PATH, self.status_data)
-        self._refresh_queue_tree()
-
-    def export_csv(self):
-        path = os.path.join(APP_DIR, "keyword_result.csv")
-        with open(path, "w", encoding="utf-8-sig", newline="") as f:
-            w = csv.writer(f)
-            w.writerow(["키워드", "등급", "점수", "검색량", "문서수", "DataLab상승률", "위험사유", "보류사유"])
-            for r in self.results:
-                w.writerow([r["keyword"], r["grade"], r["final_score"], r["search_volume"],
-                           r["doc_count"], r["spike_ratio"],
-                           "; ".join(r.get("risk_reasons", [])),
-                           "; ".join(r.get("hold_reasons", []))])
-        messagebox.showinfo("저장 완료", f"{path} 에 저장되었습니다.")
-
-    def export_txt_all(self):
-        path = os.path.join(APP_DIR, "keyword_result.txt")
-        with open(path, "w", encoding="utf-8") as f:
-            for r in self.results:
-                f.write(f"[{r['grade']}] {r['keyword']} (점수 {r['final_score']})\n")
-        messagebox.showinfo("저장 완료", f"{path} 에 저장되었습니다.")
-
-    # ---------------- 분석 실행 ----------------
-    def start_analysis(self):
-        self.status_var.set("수집 중...")
-        self.progress["value"] = 10
-        threading.Thread(target=self._run_pipeline, daemon=True).start()
-
-    def _run_pipeline(self):
+    # ---- 로그 ----------------------------------------------------------
+    def _log(self, msg):
+        ts = datetime.now().strftime("%H:%M:%S")
+        line = f"[{ts}] {msg}"
+        self.queue.put(("log", line))
         try:
-            search_api = self._get_search_api()
-            datalab_api = self._get_datalab_api()
-            ads_api = self._get_ads_api()
+            with open(LOG_FILE, "a", encoding="utf-8") as f:
+                f.write(line + "\n")
+        except Exception:
+            pass
 
+    def _poll_queue(self):
+        try:
+            while True:
+                kind, payload = self.queue.get_nowait()
+                if kind == "log":
+                    self.log_text.insert("end", payload + "\n")
+                    self.log_text.see("end")
+                elif kind == "done":
+                    self._on_analysis_done(payload)
+                elif kind == "error":
+                    self._on_analysis_error(payload)
+        except queue.Empty:
+            pass
+        self.after(150, self._poll_queue)
+
+    # ---- 분석 실행 -------------------------------------------------------
+    def _start_analysis(self):
+        if self.worker_thread and self.worker_thread.is_alive():
+            messagebox.showwarning("진행 중", "이미 분석이 진행 중입니다.")
+            return
+
+        self._save_settings()
+        required = ["naver_client_id", "naver_client_secret",
+                    "ads_customer_id", "ads_license_key", "ads_secret_key"]
+        missing = [k for k in required if not self.cfg.get(k)]
+        if missing:
+            messagebox.showerror("설정 필요", "API 설정을 모두 입력한 뒤 연결 테스트를 통과해야 합니다.")
+            return
+
+        self.run_btn.config(state="disabled")
+        self.progress.pack(fill="x", padx=10, pady=(0, 4))
+        self.progress.start(12)
+        self.log_text.delete("1.0", "end")
+        self._log("=== 분석 시작 ===")
+
+        categories = self.cfg.get("categories") or DEFAULT_CATEGORIES
+        max_workers = int(self.cfg.get("max_workers", 4))
+
+        self.worker_thread = threading.Thread(
+            target=self._worker, args=(categories, max_workers), daemon=True
+        )
+        self.worker_thread.start()
+
+    def _worker(self, categories, max_workers):
+        try:
+            search_api = NaverSearchAPI(self.cfg["naver_client_id"], self.cfg["naver_client_secret"])
+            datalab_api = NaverDataLabAPI(self.cfg["naver_client_id"], self.cfg["naver_client_secret"])
+            ads_api = NaverAdsAPI(self.cfg["ads_customer_id"], self.cfg["ads_license_key"], self.cfg["ads_secret_key"])
+            apis = {"search": search_api, "datalab": datalab_api, "ads": ads_api}
+
+            self._log(f"후보 수집 시작 (카테고리: {', '.join(categories)})")
             candidates = collector.collect_candidates(
-                search_api=search_api, discovery_target=100, light_filter_target=40, log=write_log)
-            self.root.after(0, lambda: self.progress.configure(value=40))
-            self.root.after(0, lambda: self.status_var.set("API 검증 중..."))
+                search_api=search_api,
+                discovery_target=categories,
+                light_filter_target=None,
+                log=self._log,
+                max_workers=max_workers,
+            )
+            self._log(f"후보 수집 완료: {len(candidates)}건")
 
-            results = scorer.score_candidates(
-                candidates, search_api=search_api, datalab_api=datalab_api, ads_api=ads_api,
-                verify_top_n=40, log=write_log)
+            filtered = profit_filter.filter_candidates(candidates, log=self._log)
+            self._log(f"수익형 필터 통과: {len(filtered)}건")
 
-            self.results = results
-            self.root.after(0, self._on_analysis_done)
+            results = scorer.score_candidates(filtered, apis, log=self._log)
+            self._log(f"점수 산출 및 등급 분류 완료: {len(results)}건")
+
+            self.queue.put(("done", results))
         except Exception as e:
-            write_log(f"[app] 파이프라인 오류: {e}")
-            self.root.after(0, lambda: messagebox.showerror("오류", f"분석 중 오류가 발생했습니다:\n{e}"))
-            self.root.after(0, lambda: self.status_var.set("오류 발생"))
+            tb = traceback.format_exc()
+            self._log(f"[오류] {e}")
+            self._log(tb)
+            self.queue.put(("error", str(e)))
 
-    def _on_analysis_done(self):
-        self.progress["value"] = 100
-        self.status_var.set("완료")
-        self._update_cards()
-        self._render_tree()
+    def _on_analysis_done(self, results):
+        self.progress.stop()
+        self.progress.pack_forget()
+        self.run_btn.config(state="normal")
+        self.results = results
+        self._log(f"=== 분석 종료: 총 {len(results)}건 ===")
+        self._render_cards()
 
-        # TOP5 자동 큐 등록
-        for r in self.results:
-            if r["grade"] == "TOP5" and r["keyword"] not in self.status_data:
-                self.status_data[r["keyword"]] = "미작성"
-        save_json(STATUS_PATH, self.status_data)
-        self._refresh_queue_tree()
+    def _on_analysis_error(self, err):
+        self.progress.stop()
+        self.progress.pack_forget()
+        self.run_btn.config(state="normal")
+        messagebox.showerror("분석 실패", f"오류가 발생했습니다:\n{err}\n\n로그를 확인해 주세요.")
 
-    def _render_tree(self):
-        self.tree.delete(*self.tree.get_children())
-        top30 = self.results[:30]
-        for i, r in enumerate(top30):
-            tag = {"TOP5": "top5", "TOP10": "top10", "위험": "risk", "보류": "hold"}.get(r["grade"], "hold")
-            if r.get("risk_reasons"):
-                reason_text = "; ".join(r["risk_reasons"])
-            elif r.get("hold_reasons"):
-                reason_text = "; ".join(r["hold_reasons"])
-            else:
-                reason_text = "-"
-            self.tree.insert("", "end", iid=str(i),
-                             values=(i + 1, r["keyword"], r["grade"], r["final_score"], reason_text),
-                             tags=(tag,))
+    # ---- 필터 -------------------------------------------------------------
+    def _apply_filter(self, label):
+        self.current_filter = label
+        self._render_cards()
 
+    def _filtered_results(self):
+        data = self.results
+        if self.current_filter != "전체":
+            data = [d for d in data if d.get("grade") == self.current_filter]
+        kw = self.search_var.get().strip()
+        if kw:
+            data = [d for d in data if kw in d.get("keyword", "")]
+        return data
 
-def main():
-    root = tk.Tk()
-    App(root)
-    root.mainloop()
+    # ---- 카드 렌더링 --------------------------------------------------------
+    def _render_cards(self):
+        self.card_area.clear()
+        data = self._filtered_results()
+
+        counts = {g: len([d for d in self.results if d.get("grade") == g]) for g in GRADE_ORDER}
+        self.summary_label.config(
+            text=f"TOP5 {counts['TOP5']} · TOP10 {counts['TOP10']} · 보류 {counts['보류']} · 위험 {counts['위험']}"
+        )
+
+        if not data:
+            tk.Label(self.card_area.inner, text="표시할 결과가 없습니다. '오늘 분석 시작'을 눌러 분석을 실행하세요.",
+                     bg="#FAFAFA", fg="#999999", font=("맑은 고딕", 11)).pack(pady=40)
+            return
+
+        sorted_data = sorted(
+            data,
+            key=lambda d: (GRADE_ORDER.index(d.get("grade", "보류"))
+                           if d.get("grade") in GRADE_ORDER else 99,
+                           -(d.get("final_score", 0)))
+        )
+
+        for item in sorted_data:
+            KeywordCard(self.card_area.inner, item, on_click=self._show_detail)
+
+    def _show_detail(self, data):
+        self.detail_panel.show(data)
+
+    # ---- CSV 내보내기 --------------------------------------------------------
+    def _export_csv(self):
+        if not self.results:
+            messagebox.showwarning("내보내기 불가", "내보낼 분석 결과가 없습니다.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".csv",
+            filetypes=[("CSV 파일", "*.csv")],
+            initialfile=f"keywords_{datetime.now().strftime('%Y%m%d_%H%M')}.csv",
+        )
+        if not path:
+            return
+        fields = ["rank", "grade", "keyword", "category", "final_score", "issue_score",
+                  "opportunity_score", "search_volume", "doc_count", "efficiency",
+                  "mentions", "timing", "risk_reasons", "hold_reasons"]
+        try:
+            with open(path, "w", newline="", encoding="utf-8-sig") as f:
+                writer = csv.DictWriter(f, fieldnames=fields, extrasaction="ignore")
+                writer.writeheader()
+                for item in self.results:
+                    row = dict(item)
+                    row["risk_reasons"] = ", ".join(item.get("risk_reasons", []))
+                    row["hold_reasons"] = ", ".join(item.get("hold_reasons", []))
+                    writer.writerow(row)
+            messagebox.showinfo("내보내기 완료", f"저장되었습니다:\n{path}")
+        except Exception as e:
+            messagebox.showerror("내보내기 실패", str(e))
 
 
 if __name__ == "__main__":
-    main()
+    app = App()
+    app.mainloop()
