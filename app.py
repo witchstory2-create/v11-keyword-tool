@@ -1,8 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-app.py (v17.1) - 수익형 키워드 발굴기
+app.py (v17.2) - 수익형 키워드 발굴기
 v16의 UX(작성 큐, 상태 관리, 제목/개요/FAQ/태그, TXT/CSV 저장, 클립보드 복사)
-+ v17의 알고리즘(기사 단위 bigram, 검증 3종 API, 포화도 기반 채점)
++ v17 알고리즘(기사 단위 bigram, 검증 3종 API, 포화도 기반 채점)
++ v17.2: 위험/보류 사유 분리 표시
 """
 
 import os
@@ -29,6 +30,7 @@ COLOR_CARD = "#FFFFFF"
 COLOR_BLUE = "#2F6FED"
 COLOR_GREEN = "#1B8A5A"
 COLOR_RED = "#D64545"
+COLOR_ORANGE = "#C77B18"
 COLOR_GRAY = "#8A8F98"
 FONT_FAMILY = "맑은 고딕"
 
@@ -124,7 +126,7 @@ class ScrollableText(tk.Frame):
 class App:
     def __init__(self, root):
         self.root = root
-        self.root.title("수익형 키워드 발굴기 v17.1")
+        self.root.title("수익형 키워드 발굴기 v17.2")
         self.root.geometry("1440x900")
         self.root.configure(bg=COLOR_BG)
 
@@ -161,7 +163,7 @@ class App:
     def _build_header(self):
         header = tk.Frame(self.root, bg=COLOR_NAVY, height=54)
         header.pack(fill="x", side="top")
-        tk.Label(header, text="수익형 키워드 발굴기 v17.1", bg=COLOR_NAVY, fg="white",
+        tk.Label(header, text="수익형 키워드 발굴기 v17.2", bg=COLOR_NAVY, fg="white",
                  font=(FONT_FAMILY, 14, "bold")).pack(side="left", padx=16, pady=10)
 
         btn_frame = tk.Frame(header, bg=COLOR_NAVY)
@@ -309,7 +311,7 @@ class App:
         self.cards_frame = tk.Frame(self.root, bg=COLOR_BG)
         self.cards_frame.pack(fill="x", padx=10, pady=(10, 4))
         self.card_vars = {}
-        labels = ["검증 완료 키워드", "TOP5 추천", "TOP10 후보", "위험 키워드", "마지막 실행"]
+        labels = ["검증 완료 키워드", "TOP5 추천", "TOP10 후보", "보류", "위험 키워드", "마지막 실행"]
         for lb in labels:
             card = tk.Frame(self.cards_frame, bg=COLOR_CARD, bd=0, highlightbackground="#DDE1E8",
                              highlightthickness=1)
@@ -326,10 +328,12 @@ class App:
                        or r["search_status"] == "검증 완료" or r["datalab_status"] == "검증 완료")
         top5 = sum(1 for r in self.results if r["grade"] == "TOP5")
         top10 = sum(1 for r in self.results if r["grade"] == "TOP10")
+        hold = sum(1 for r in self.results if r["grade"] == "보류")
         risk = sum(1 for r in self.results if r["grade"] == "위험")
         self.card_vars["검증 완료 키워드"].set(str(verified))
         self.card_vars["TOP5 추천"].set(str(top5))
         self.card_vars["TOP10 후보"].set(str(top10))
+        self.card_vars["보류"].set(str(hold))
         self.card_vars["위험 키워드"].set(str(risk))
         self.card_vars["마지막 실행"].set(time.strftime("%H:%M:%S"))
 
@@ -355,15 +359,15 @@ class App:
             anchor="w", padx=8, pady=6)
         cols = ("rank", "keyword", "grade", "score", "risk")
         self.tree = ttk.Treeview(left, columns=cols, show="headings", height=25)
-        headers = {"rank": "순위", "keyword": "키워드", "grade": "등급", "score": "점수", "risk": "위험여부"}
-        widths = {"rank": 40, "keyword": 170, "grade": 55, "score": 55, "risk": 90}
+        headers = {"rank": "순위", "keyword": "키워드", "grade": "등급", "score": "점수", "risk": "위험/보류 사유"}
+        widths = {"rank": 40, "keyword": 170, "grade": 55, "score": 55, "risk": 230}
         for c in cols:
             self.tree.heading(c, text=headers[c])
             self.tree.column(c, width=widths[c], anchor="center")
         self.tree.tag_configure("top5", foreground=COLOR_GREEN)
         self.tree.tag_configure("top10", foreground=COLOR_BLUE)
         self.tree.tag_configure("risk", foreground=COLOR_RED)
-        self.tree.tag_configure("hold", foreground=COLOR_GRAY)
+        self.tree.tag_configure("hold", foreground=COLOR_ORANGE)
         vs = ttk.Scrollbar(left, command=self.tree.yview)
         self.tree.configure(yscrollcommand=vs.set)
         self.tree.pack(side="left", fill="both", expand=True, padx=(8, 0), pady=(0, 8))
@@ -419,15 +423,22 @@ class App:
         lines.append(f"- 효율(검색량/문서수): {r['efficiency']:.2f}" if r.get("efficiency") else "- 효율: 산출 불가")
         lines.append(f"- 추정 월수익(참고용): {r['estimated_revenue_won']:,}원" if r.get("estimated_revenue_won") else "- 추정 월수익: 산출 불가")
         lines.append("")
-        lines.append("[위험 사유]")
-        if r["risk_reasons"]:
+        lines.append("[위험 사유] - 범용/상시성 키워드일 때만 표시")
+        if r.get("risk_reasons"):
             for reason in r["risk_reasons"]:
                 lines.append(f"  ! {reason}")
         else:
             lines.append("  - 없음")
         lines.append("")
+        lines.append("[보류(우선순위 하락) 사유] - 위험은 아니지만 오늘 우선순위가 낮은 이유")
+        if r.get("hold_reasons"):
+            for reason in r["hold_reasons"]:
+                lines.append(f"  · {reason}")
+        else:
+            lines.append("  - 없음")
+        lines.append("")
         lines.append("[추천 이유 태그]")
-        for tag in r["recommend_tags"]:
+        for tag in r.get("recommend_tags", []):
             lines.append(f"  ✓ {tag}")
         lines.append("")
         lines.append("[참고 기사]")
@@ -520,10 +531,12 @@ class App:
         path = os.path.join(APP_DIR, "keyword_result.csv")
         with open(path, "w", encoding="utf-8-sig", newline="") as f:
             w = csv.writer(f)
-            w.writerow(["키워드", "등급", "점수", "검색량", "문서수", "DataLab상승률", "위험사유"])
+            w.writerow(["키워드", "등급", "점수", "검색량", "문서수", "DataLab상승률", "위험사유", "보류사유"])
             for r in self.results:
                 w.writerow([r["keyword"], r["grade"], r["final_score"], r["search_volume"],
-                           r["doc_count"], r["spike_ratio"], "; ".join(r["risk_reasons"])])
+                           r["doc_count"], r["spike_ratio"],
+                           "; ".join(r.get("risk_reasons", [])),
+                           "; ".join(r.get("hold_reasons", []))])
         messagebox.showinfo("저장 완료", f"{path} 에 저장되었습니다.")
 
     def export_txt_all(self):
@@ -579,9 +592,14 @@ class App:
         top30 = self.results[:30]
         for i, r in enumerate(top30):
             tag = {"TOP5": "top5", "TOP10": "top10", "위험": "risk", "보류": "hold"}.get(r["grade"], "hold")
-            risk_text = "; ".join(r["risk_reasons"]) if r["risk_reasons"] else "-"
+            if r.get("risk_reasons"):
+                reason_text = "; ".join(r["risk_reasons"])
+            elif r.get("hold_reasons"):
+                reason_text = "; ".join(r["hold_reasons"])
+            else:
+                reason_text = "-"
             self.tree.insert("", "end", iid=str(i),
-                             values=(i + 1, r["keyword"], r["grade"], r["final_score"], risk_text),
+                             values=(i + 1, r["keyword"], r["grade"], r["final_score"], reason_text),
                              tags=(tag,))
 
 
