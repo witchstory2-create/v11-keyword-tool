@@ -92,7 +92,6 @@ def build_candidates(words):
 def collect_issue_keywords():
     titles = fetch_news_titles()
     words = extract_clean_words(titles)
-
     candidates = build_candidates(words)
 
     default_keywords = [
@@ -100,14 +99,19 @@ def collect_issue_keywords():
         "국민연금 개편",
         "퇴직연금 수령방법",
         "연금저축 세액공제",
-        "청약 조건 변경",
+        "청약 조건",
         "전세대출 금리",
         "자동차보험료 인상",
         "실업급여 조건",
         "지원금 신청",
-        "세금 환급 조회"
+        "세금 환급 조회",
+        "IRP 세액공제",
+        "연말정산 환급",
+        "주택청약 조건",
+        "자동차보험 비교",
+        "건강보험료 조회"
     ]
 
-    final = candidates + default_keywords
+    final = default_keywords + candidates
 
     return list(dict.fromkeys(final))[:80]
