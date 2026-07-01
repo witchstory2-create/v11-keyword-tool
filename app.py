@@ -1,13 +1,7 @@
 # app.py
-# v16.8 - 이슈 수익형 블로그 글 추천기 (검색어트렌드 급증 검증 반영)
-# 변경 사항(2026-07):
-#   1) 데이터랩 검색어트렌드(Client ID/Secret) 입력칸 추가.
-#      값을 넣으면 1차 스코어링 후 상위 20개 후보만 추가로 데이터랩 API를 호출해서
-#      "뉴스 언급은 많지만 실제 검색량은 평소와 비슷한" 상시성 키워드를 걸러내고,
-#      진짜 검색량이 급증한 키워드만 HOT 이슈로 남깁니다.
-#      비워두면 트렌드 검증 없이 기존처럼 동작합니다 (필수 아님).
-#   2) 좌측 표에 "검증" 컬럼 추가: 🔥(실제 급증 확인) / ℹ(상시성으로 재분류) / -(미검증)
-#   3) TOP5 큐, 상세보기에도 검증 결과 문구 표시.
+# v16.9 - 이모지 표시 문제 해결 (일반 텍스트 태그로 교체) + 트렌드 API 오류를
+#         trend_debug_log.txt 파일로 확인할 수 있도록 안내 문구 추가.
+#         나머지 로직은 v16.8과 동일.
 
 import csv
 import threading
@@ -27,9 +21,9 @@ from config_manager import save_config, load_config
 
 analysis_results = []
 queue_items = []
-keyword_lookup = {}  # 키워드 -> 전체 분석 데이터(우선순위/안내문구/트렌드검증 포함) 빠른 조회용
+keyword_lookup = {}
 
-TREND_RECHECK_TOP_N = 20  # 데이터랩 API 호출 제한을 고려해 상위 N개만 재검증
+TREND_RECHECK_TOP_N = 20
 
 
 # ---------------------- 설정 저장/불러오기 ----------------------
@@ -128,15 +122,14 @@ def run_analysis():
             seen.add(r["keyword"])
             unique_results.append(r)
 
-    # ---------------------- [NEW] 상위 후보만 데이터랩 검색어트렌드로 재검증 ----------------------
     datalab_id = datalab_id_entry.get().strip()
     datalab_secret = datalab_secret_entry.get().strip()
     trend_checked_count = 0
+    trend_error_count = 0
 
     if datalab_id and datalab_secret:
         root.after(0, lambda: status.config(text="상위 키워드 실제 검색 급증 여부 확인 중..."))
 
-        # HOT 이슈로 분류된 것 + final_score 상위 항목을 우선 재검증 대상으로 선정
         unique_results.sort(key=lambda x: x["final_score"], reverse=True)
         recheck_targets = unique_results[:TREND_RECHECK_TOP_N]
 
@@ -146,7 +139,10 @@ def run_analysis():
                 recheck_with_trend(r, trend)
                 if trend.get("trend_available"):
                     trend_checked_count += 1
+                else:
+                    trend_error_count += 1
             except Exception as e:
+                trend_error_count += 1
                 print("데이터랩 API 오류:", r["keyword"], e)
 
     analysis_results = unique_results
@@ -163,13 +159,13 @@ def run_analysis():
             r["priority_rank"] = rank
             keyword_lookup[r["keyword"]] = r
 
-            depth_display = f"x{r['ad_depth_multiplier']}" + (" ⭐" if r.get("low_search_high_value") else "")
+            depth_display = f"x{r['ad_depth_multiplier']}" + (" *" if r.get("low_search_high_value") else "")
             priority_display = f"{rank}위"
 
-            # [NEW] 검증 컬럼: 🔥(실제 급증 확인) / ℹ(상시성 재분류) / -(미검증)
+            # [FIXED] 이모지 대신 일반 텍스트 태그 사용
             if r.get("trend_checked"):
                 spike = r.get("spike_ratio") or 1.0
-                verify_display = f"🔥x{spike}" if spike >= 2.0 else f"ℹ x{spike}"
+                verify_display = f"[급증]x{spike}" if spike >= 2.0 else f"[평이]x{spike}"
             else:
                 verify_display = "-"
 
@@ -180,7 +176,12 @@ def run_analysis():
                 r["final_score"], r["type"], r["difficulty"]
             ))
 
-        trend_note = f" / 검증 완료 {trend_checked_count}개" if (datalab_id and datalab_secret) else " / 트렌드 미검증(데이터랩 키 미입력)"
+        if datalab_id and datalab_secret:
+            trend_note = (f" / 검증 완료 {trend_checked_count}개, 검증 실패 {trend_error_count}개"
+                          f"{' (원인은 trend_debug_log.txt 확인)' if trend_error_count > 0 else ''}")
+        else:
+            trend_note = " / 트렌드 미검증(데이터랩 키 미입력)"
+
         status.config(text=f"완료: {len(unique_results)}개 분석 / API 오류 {error_count}개{trend_note}")
 
         build_queue(filter_top5(unique_results))
@@ -198,8 +199,6 @@ def show_titles():
         return
 
     values = tree.item(selected[0], "values")
-    # 컬럼 순서: priority(0) keyword(1) pc(2) mobile(3) competition(4) addepth(5) verify(6)
-    #            issue(7) profit(8) revenue(9) final(10) type(11) difficulty(12)
     keyword = values[1]
     difficulty = values[12] if len(values) > 12 else "보통"
 
@@ -226,14 +225,14 @@ def render_keyword_detail(keyword, difficulty="보통", full_data=None):
     if revenue is not None:
         detail_box.insert(tk.END, f"▶ 예상 월수익(추정): 약 {revenue:,.0f}원\n")
 
-    # [NEW] 트렌드 검증 결과 표시
+    # [FIXED] 이모지 대신 일반 텍스트 태그 사용
     if trend_checked and spike_ratio is not None:
         if spike_ratio >= 2.0:
-            detail_box.insert(tk.END, f"▶ 🔥 실제 검색량 급증 확인 (평소 대비 x{spike_ratio}) - 실시간 이슈 가능성 높음\n")
+            detail_box.insert(tk.END, f"▶ [급증 확인] 실제 검색량이 평소 대비 x{spike_ratio}배 - 실시간 이슈 가능성 높음\n")
         else:
-            detail_box.insert(tk.END, f"▶ ℹ 실제 검색량은 평소와 비슷함 (x{spike_ratio}) - 상시성 키워드일 가능성, 급하게 쓸 필요 없음\n")
+            detail_box.insert(tk.END, f"▶ [평이함] 실제 검색량은 평소와 비슷함(x{spike_ratio}) - 상시성 키워드, 급하게 쓸 필요 없음\n")
     else:
-        detail_box.insert(tk.END, "▶ ⚠ 검색어트렌드 미검증 - 실제 뉴스 검색으로 한 번 확인 권장\n")
+        detail_box.insert(tk.END, "▶ [미검증] 검색어트렌드 확인 안 됨 - 실제 뉴스 검색으로 한 번 확인 권장\n")
 
     detail_box.insert(tk.END, "\n")
     detail_box.insert(tk.END, "[검색용 제목 3개]\n")
@@ -278,7 +277,6 @@ def build_queue(top5):
             "status": "미작성",
             "writing_guidance": item.get("writing_guidance", ""),
             "type_code": item.get("type_code", "RECURRING_PROFIT"),
-            # [NEW]
             "trend_checked": item.get("trend_checked", False),
             "spike_ratio": item.get("spike_ratio"),
         })
@@ -299,7 +297,7 @@ def render_queue():
         row.pack(fill="x", pady=4, padx=4)
 
         status_icon = {"미작성": "☐", "작성완료": "☑", "발행완료": "✅"}.get(q["status"], "☐")
-        hidden_gem = " ⭐숨은고수익" if q.get("low_search_high_value") else ""
+        hidden_gem = " [숨은고수익]" if q.get("low_search_high_value") else ""
         header = (f"{q['rank']}위  {q['keyword']}   난이도: {q['difficulty']}   "
                    f"예상수익: {q['estimated_revenue_krw']:,.0f}원{hidden_gem}   "
                    f"{status_icon} {q['status']}")
@@ -313,19 +311,19 @@ def render_queue():
                      font=("맑은 고딕", 10, "bold"), fg=color, anchor="w",
                      wraplength=560, justify="left").pack(fill="x", padx=6, pady=(0, 2))
 
-        # [NEW] 트렌드 검증 결과 한 줄 표시
+        # [FIXED] 이모지 대신 일반 텍스트 태그 사용
         if q.get("trend_checked") and q.get("spike_ratio") is not None:
             spike = q["spike_ratio"]
             if spike >= 2.0:
-                trend_text = f"🔥 실제 검색량 급증 확인 (평소 대비 x{spike})"
+                trend_text = f"[급증 확인] 실제 검색량이 평소 대비 x{spike}배"
                 trend_color = "#c0392b"
             else:
-                trend_text = f"ℹ 검색량은 평소와 비슷함 (x{spike}) - 급하게 쓸 필요 없음"
+                trend_text = f"[평이함] 검색량은 평소와 비슷함(x{spike}) - 급하게 쓸 필요 없음"
                 trend_color = "gray30"
             tk.Label(row, text=trend_text, fg=trend_color, anchor="w",
                      wraplength=560, justify="left").pack(fill="x", padx=6, pady=(0, 2))
         else:
-            tk.Label(row, text="⚠ 검색어트렌드 미검증 - 실제 뉴스 검색으로 확인 권장", fg="#7f8c8d",
+            tk.Label(row, text="[미검증] 검색어트렌드 확인 안 됨 - 실제 뉴스 검색으로 확인 권장", fg="#7f8c8d",
                      anchor="w", wraplength=560, justify="left").pack(fill="x", padx=6, pady=(0, 2))
 
         reason_text = "   ".join(f"✔ {r}" for r in q["reason"])
@@ -420,7 +418,6 @@ tk.Label(api_frame, text="SECRET_KEY").grid(row=0, column=4, padx=5, pady=5)
 secret_entry = tk.Entry(api_frame, width=35, show="*")
 secret_entry.grid(row=0, column=5, padx=5, pady=5)
 
-# [NEW] 데이터랩 검색어트렌드 Client ID/Secret 입력칸
 tk.Label(api_frame, text="데이터랩 Client ID (선택)").grid(row=1, column=0, padx=5, pady=5)
 datalab_id_entry = tk.Entry(api_frame, width=20)
 datalab_id_entry.grid(row=1, column=1, padx=5, pady=5)
@@ -438,7 +435,8 @@ tk.Button(api_frame, text="API 키 저장", command=save_current_config, width=1
 tk.Label(
     api_frame,
     text="※ 한 번 저장하면 다음 실행부터 자동으로 입력됩니다. (같은 폴더의 config.json에 저장, GitHub에는 올리지 마세요)\n"
-         "※ 데이터랩 Client ID/Secret을 입력하면 상위 20개 키워드의 실제 검색 급증 여부를 추가로 검증합니다 (비워두면 검증 없이 진행).",
+         "※ 데이터랩 Client ID/Secret을 입력하면 상위 20개 키워드의 실제 검색 급증 여부를 추가로 검증합니다 (비워두면 검증 없이 진행).\n"
+         "※ 트렌드 검증에 실패한 항목이 있으면, 이 프로그램과 같은 폴더에 생기는 trend_debug_log.txt 파일에서 원인을 확인할 수 있습니다.",
     fg="gray40", font=("맑은 고딕", 8), justify="left"
 ).grid(row=3, column=0, columnspan=6, padx=5, pady=2, sticky="w")
 
@@ -467,7 +465,6 @@ main_pane.pack(fill="both", expand=True, padx=15, pady=8)
 left_frame = tk.Frame(main_pane)
 main_pane.add(left_frame, weight=3)
 
-# [CHANGED] "verify"(검증) 컬럼 추가
 columns = ("priority", "keyword", "pc", "mobile", "competition", "addepth", "verify",
            "issue", "profit", "revenue", "final", "type", "difficulty")
 tree = ttk.Treeview(left_frame, columns=columns, show="headings", height=25)
@@ -486,7 +483,7 @@ tree.column("keyword", width=170)
 tree.column("type", width=100)
 tree.column("revenue", width=90)
 tree.column("addepth", width=75)
-tree.column("verify", width=75)
+tree.column("verify", width=85)
 
 tree.pack(fill="both", expand=True)
 tree.bind("<<TreeviewSelect>>", lambda e: show_titles())
@@ -494,7 +491,7 @@ tree.bind("<<TreeviewSelect>>", lambda e: show_titles())
 right_pane = ttk.PanedWindow(main_pane, orient="vertical")
 main_pane.add(right_pane, weight=4)
 
-queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐 (글작성순위 기준, 🔥=검색급증 확인, ⭐=숨은 고수익 키워드)")
+queue_outer = tk.LabelFrame(right_pane, text="오늘의 TOP 5 작성 큐 (글작성순위 기준, [급증]=검색급증 확인, [숨은고수익]=경쟁 치열 키워드)")
 right_pane.add(queue_outer, weight=1)
 
 queue_canvas = tk.Canvas(queue_outer, height=280)
