@@ -36,7 +36,7 @@ def get_difficulty(keyword):
 def score_keyword(item, source_meta):
     """
     item: 네이버 검색광고 API에서 온 개별 키워드 데이터
-    source_meta: collector.py에서 넘어온 {"mentions": int, "is_money_topic": bool}
+    source_meta: collector.py에서 넘어온 {"keyword": str, "mentions": int, "is_money_topic": bool}
     """
     keyword = item.get("relKeyword", "")
     pc = to_int(item.get("monthlyPcQcCnt", 0))
@@ -44,8 +44,18 @@ def score_keyword(item, source_meta):
     total = pc + mobile
     comp = item.get("compIdx", "LOW")
 
-    mentions = source_meta.get("mentions", 0)
+    seed_keyword = source_meta.get("keyword", "")
+    raw_mentions = source_meta.get("mentions", 0)
     is_money_topic = source_meta.get("is_money_topic", False)
+
+    # 네이버가 돌려준 실제 키워드가 시드와 얼마나 밀접한지에 따라 mentions 신뢰도를 조정
+    # (시드를 포함하지 않는 느슨한 파생 키워드는 이슈점수를 그대로 물려받지 않도록 할인)
+    seed_norm = seed_keyword.replace(" ", "")
+    keyword_norm = keyword.replace(" ", "")
+    if seed_norm and seed_norm in keyword_norm:
+        mentions = raw_mentions
+    else:
+        mentions = round(raw_mentions * 0.3)
 
     # --- 이슈 점수: 실제 뉴스 언급 빈도가 핵심 축 ---
     mention_score = min(mentions * 8, 50)
