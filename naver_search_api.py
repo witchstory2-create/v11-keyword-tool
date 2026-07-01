@@ -218,7 +218,7 @@ class NaverDataLabAPI:
 # 3) 검색광고 API - 검색량 / 경쟁도
 # ------------------------------------------------------------------
 class NaverAdsAPI:
-    BASE = "https://api.naver.com"
+    BASE = "https://api.searchad.naver.com"
 
     def __init__(self, customer_id, license_key, secret_key):
         self.customer_id = (customer_id or "").strip()
