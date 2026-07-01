@@ -1,46 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-naver_search_api.py (v18.7)
+naver_search_api.py (v18.8)
 ----------------------------------------------------
 네이버 API 3종 래퍼 + 개별 연결 테스트 + collector.py/scorer.py 호환 메서드
 
-[이 파일의 역할]
-1) NaverSearchAPI   : 검색 Open API (뉴스 수집 / 블로그 문서수 조회)
-                      -> collector.py, scorer.py가 사용
-2) NaverDataLabAPI  : 데이터랩 검색어트렌드 (DataLab 상승률 조회) -> scorer.py가 사용
-3) NaverAdsAPI      : 검색광고 API (검색량/연관검색어/경쟁도 조회) -> scorer.py가 사용
+[v18.7에서 유지된 것]
+- NaverSearchAPI.search_news(), get_blog_doc_count()
+- NaverAdsAPI.get_search_volume(), get_related_keywords()
+- NaverDataLabAPI.get_trend_ratio()
+- 모든 저수준 진단/연결테스트 로직(_diagnose, test_connection 3종 등)
 
-[이 파일이 하지 않는 일]
-- 후보 추출, 노이즈 제거 -> collector.py
-- 수익형 필터링, 카테고리 가중치 -> profit_filter.py
-- 점수 계산, 등급 분류 -> scorer.py
-- 화면 표시 -> app.py
+[v18.8 변경 사항 - API 과호출(429) / 응답지연(timeout) 대응]
+문서수 조회(429 다발)와 DataLab 조회(read timeout 다발)에서 실패가
+곧바로 예외로 이어져 scorer.py 단계에서 대량 탈락이 발생하던 문제를
+해결하기 위해, 아래 두 지점에만 재시도/백오프를 추가했다.
 
-[v18.7 변경 사항 - collector.py 호환성 추가]
-기존 저수준 메서드/진단 로직(_http_get, _http_post_json, _diagnose,
-test_connection 3종, _search_total, get_news_doc_count, get_trend,
-get_spike_ratio, get_keyword_stats, _signature, _headers 등)은
-전혀 수정하지 않고 그대로 유지했다.
+    1) NaverSearchAPI._search_total() (get_blog_doc_count, get_news_doc_count가 사용)
+       -> 429 발생 시 2초 -> 5초 -> 10초 순서로 대기 후 최대 3회 재시도
+       -> timeout 발생 시 1초 대기 후 최대 2회 재시도
 
-이번에 새로 추가된 것은 다음 5개 메서드뿐이다.
+    2) NaverDataLabAPI.get_trend()  (get_spike_ratio, get_trend_ratio가 사용)
+       -> 위와 동일한 429/timeout 재시도 정책 적용
+       -> HTTP 타임아웃 값을 6초 -> 12초로 상향 (DataLab 응답 지연 대응)
 
-    - NaverSearchAPI.search_news(query, display, start, sort)
-        -> collector.py의 _fetch_seed_news()가 호출하는 뉴스 검색 메서드.
-           반환 형식: [{"title":"", "description":"", "link":"",
-                        "originallink":"", "pubDate":""}, ...]
-           (v18.6에서 이 메서드가 누락되어 있어 collector.py가 모든 시드
-            쿼리에서 조용히 실패, 최종 결과가 항상 0건이 되는 문제가 있었음)
-
-    - NaverSearchAPI.get_blog_doc_count(query)      -> scorer.py 호환 (v18.6에서 추가)
-    - NaverAdsAPI.get_search_volume(keyword)        -> scorer.py 호환 (v18.6에서 추가)
-    - NaverAdsAPI.get_related_keywords(keyword, limit) -> scorer.py 호환 (v18.6에서 추가)
-    - NaverDataLabAPI.get_trend_ratio(keyword)      -> scorer.py 호환 (v18.6에서 추가)
-
-get_blog_doc_count/get_search_volume/get_related_keywords/get_trend_ratio는
-값을 직접 반환하고 실패 시 예외를 던지는 방식이며, search_news도 동일하게
-실패 시 예외를 던진다. collector.py의 _fetch_seed_news()는 이 예외를
-try/except로 잡아 로그에만 남기고 안전하게 다음 시드로 넘어가도록 이미
-설계되어 있으므로 이 파일에서 별도의 방어 로직을 추가하지 않았다.
+그 외 메서드(test_connection, search_news, get_search_volume,
+get_related_keywords 등)는 전혀 수정하지 않았다. 재시도는 200/401/403/404
+등 재시도해도 결과가 바뀌지 않는 상태코드에는 적용되지 않고, 오직
+429(호출 한도 초과)와 timeout(응답 지연)에만 적용된다.
 
 표준 라이브러리만 사용 (urllib.request, hmac, hashlib, base64) -> requests 등 외부 패키지 불필요,
 PyInstaller onefile 빌드에 안전.
@@ -96,6 +82,59 @@ def _http_post_json(url, payload, headers=None, timeout=6):
         return -1, str(e.reason)
     except Exception as e:
         return -2, str(e)
+
+
+# ------------------------------------------------------------------
+# [v18.8 신규] 429 / timeout 재시도 래퍼
+# ------------------------------------------------------------------
+def _sleep_backoff_429(attempt):
+    """429 재시도 대기 시간: 1회차 2초, 2회차 5초, 3회차(이후) 10초."""
+    steps = (2, 5, 10)
+    idx = min(attempt, len(steps) - 1)
+    time.sleep(steps[idx])
+
+
+def _is_timeout_error(status, body):
+    if status not in (-1, -2):
+        return False
+    b = str(body).lower()
+    return "timed out" in b or "timeout" in b
+
+
+def _http_get_retry(url, headers=None, timeout=6, max_429_retries=3, max_timeout_retries=2):
+    """
+    _http_get을 감싸 429(호출 한도 초과)와 timeout(응답 지연) 상황에서만 재시도한다.
+    200/401/403/404 등 재시도해도 결과가 바뀌지 않는 상태코드는 즉시 그대로 반환한다.
+    """
+    tries_429 = 0
+    tries_timeout = 0
+    while True:
+        status, body = _http_get(url, headers=headers, timeout=timeout)
+        if status == 429 and tries_429 < max_429_retries:
+            _sleep_backoff_429(tries_429)
+            tries_429 += 1
+            continue
+        if _is_timeout_error(status, body) and tries_timeout < max_timeout_retries:
+            time.sleep(1.0)
+            tries_timeout += 1
+            continue
+        return status, body
+
+
+def _http_post_json_retry(url, payload, headers=None, timeout=10, max_429_retries=3, max_timeout_retries=2):
+    tries_429 = 0
+    tries_timeout = 0
+    while True:
+        status, body = _http_post_json(url, payload, headers=headers, timeout=timeout)
+        if status == 429 and tries_429 < max_429_retries:
+            _sleep_backoff_429(tries_429)
+            tries_429 += 1
+            continue
+        if _is_timeout_error(status, body) and tries_timeout < max_timeout_retries:
+            time.sleep(1.0)
+            tries_timeout += 1
+            continue
+        return status, body
 
 
 def _diagnose(status, body, kind):
@@ -180,10 +219,13 @@ class NaverSearchAPI:
         return False, "❌ " + _diagnose(status, body, "search"), warn or ""
 
     def _search_total(self, kind, query):
-        """기존 저수준 메서드 - 수정하지 않음. (총 문서수, 에러메시지) 튜플 반환."""
+        """
+        [v18.8 수정] 429/timeout 재시도 래퍼(_http_get_retry) 적용.
+        기존 반환 형식((총 문서수, 에러메시지) 튜플)은 그대로 유지했다.
+        """
         url = "https://openapi.naver.com/v1/search/%s.json?query=%s&display=1" % (
             kind, urllib.parse.quote(query))
-        status, body = _http_get(url, headers=self._headers())
+        status, body = _http_get_retry(url, headers=self._headers(), timeout=8)
         if status != 200:
             return None, _diagnose(status, body, "search")
         try:
@@ -193,33 +235,13 @@ class NaverSearchAPI:
             return None, f"응답 파싱 오류: {e}"
 
     def get_news_doc_count(self, query):
-        """기존 메서드 - 수정하지 않음. (총 문서수, 에러메시지) 튜플 반환."""
+        """기존 메서드 - 반환 형식 변경 없음(내부적으로 재시도 적용됨)."""
         return self._search_total("news", query)
 
-    # ----------------------------------------------------------------
-    # [collector.py 호환 메서드] search_news(query, display, start, sort)
-    # ----------------------------------------------------------------
     def search_news(self, query, display=100, start=1, sort="date"):
         """
         collector.py의 _fetch_seed_news()가 호출하는 뉴스 검색 메서드.
-        네이버 뉴스 검색 Open API(/v1/search/news.json)를 호출해 기사 목록을 반환한다.
-
-        반환 형식:
-            [
-                {
-                    "title": str,
-                    "description": str,
-                    "link": str,
-                    "originallink": str,
-                    "pubDate": str,
-                },
-                ...
-            ]
-
-        display는 네이버 API 정책상 최대 100, start는 최대 1000까지만 허용되므로
-        해당 범위를 넘는 값은 자동으로 잘라낸다(clamp).
-        조회 실패 시 예외를 발생시키며, collector.py는 이를 try/except로 잡아
-        로그에만 남기고 다음 시드로 안전하게 넘어가도록 이미 설계되어 있다.
+        v18.7과 동일하게 유지 (재시도 로직 미적용 - 수집 단계는 429 이슈가 없었음).
         """
         display = max(1, min(int(display), 100))
         start = max(1, min(int(start), 1000))
@@ -251,14 +273,10 @@ class NaverSearchAPI:
             })
         return result
 
-    # ----------------------------------------------------------------
-    # [scorer.py 호환 메서드] get_blog_doc_count(keyword) -> int
-    # ----------------------------------------------------------------
     def get_blog_doc_count(self, query):
         """
         scorer.py 호환 인터페이스.
-        블로그 총 문서수(int)를 직접 반환하며, 조회 실패 시 예외를 발생시킨다.
-        (scorer.py의 _safe_call이 이 예외를 잡아 api_health["search"]를 "fail"로 기록한다)
+        [v18.8] _search_total 내부에 재시도가 적용되어 429/timeout에 더 강해졌다.
         """
         count, err = self._search_total("blog", query)
         if count is None:
@@ -292,7 +310,10 @@ class NaverDataLabAPI:
         return False, "❌ " + (err or "알 수 없는 오류"), hint
 
     def get_trend(self, keyword, days=30):
-        """기존 메서드 - 수정하지 않음. (일별 데이터 리스트, 에러메시지) 반환."""
+        """
+        [v18.8 수정] timeout 6초 -> 12초 상향, 429/timeout 재시도 래퍼 적용.
+        반환 형식((일별 데이터 리스트, 에러메시지) 튜플)은 그대로 유지했다.
+        """
         import datetime
         end = datetime.date.today()
         start = end - datetime.timedelta(days=days)
@@ -302,8 +323,10 @@ class NaverDataLabAPI:
             "timeUnit": "date",
             "keywordGroups": [{"groupName": keyword, "keywords": [keyword]}],
         }
-        status, body = _http_post_json(
-            "https://openapi.naver.com/v1/datalab/search", payload, headers=self._headers())
+        status, body = _http_post_json_retry(
+            "https://openapi.naver.com/v1/datalab/search", payload,
+            headers=self._headers(), timeout=12
+        )
         if status != 200:
             return None, _diagnose(status, body, "datalab")
         try:
@@ -334,16 +357,11 @@ class NaverDataLabAPI:
         spike = recent_avg / base_avg
         return True, round(spike, 3), None
 
-    # ----------------------------------------------------------------
-    # [scorer.py 호환 메서드] get_trend_ratio(keyword) -> float
-    # ----------------------------------------------------------------
     def get_trend_ratio(self, keyword, days=30, recent_days=3):
         """
         scorer.py 호환 인터페이스.
-        최근기간 대비 이전기간 검색관심도 비율(float)을 직접 반환한다.
-        (예: 1.6이면 60% 상승, scorer.py의 DATALAB_HARD_CUT=1.3과 비교됨)
-        실제 API/네트워크 오류일 때만 예외를 발생시키고, 데이터 자체가 없어 상승/하락을
-        판단할 수 없는 경우는 get_spike_ratio가 이미 중립값 1.0을 반환하므로 그대로 넘긴다.
+        [v18.8] get_trend 내부 재시도/timeout 상향이 적용되어 이전보다 timeout 실패가 줄어든다.
+        여전히 실패하면 예외를 던지며, scorer.py는 이 경우 중립값(1.0)으로 대체 처리한다.
         """
         ok, ratio, err = self.get_spike_ratio(keyword, days=days, recent_days=recent_days)
         if not ok:
@@ -352,9 +370,7 @@ class NaverDataLabAPI:
 
 
 # ------------------------------------------------------------------
-# 3) 검색광고 API - 검색량 / 연관검색어 / 경쟁도
-#    BASE URL은 반드시 api.searchad.naver.com 이어야 한다.
-#    (api.naver.com으로 호출하면 308 Permanent Redirect가 발생함)
+# 3) 검색광고 API - 검색량 / 연관검색어 / 경쟁도 (v18.7과 완전히 동일 - 미수정)
 # ------------------------------------------------------------------
 class NaverAdsAPI:
     BASE = "https://api.searchad.naver.com"
@@ -398,11 +414,6 @@ class NaverAdsAPI:
         return False, "❌ " + _diagnose(status, body, "ads"), warn or ""
 
     def _fetch_keywordstool(self, keyword):
-        """
-        기존 get_keyword_stats가 호출하던 것과 동일한 원본 API 응답(keywordList)을
-        반환하는 저수준 헬퍼. get_search_volume/get_related_keywords가 함께 재사용한다.
-        (raw_list, error) 튜플 반환.
-        """
         uri = "/keywordstool"
         query = "hintKeywords=%s&showDetail=1" % urllib.parse.quote(keyword)
         url = self.BASE + uri + "?" + query
@@ -417,7 +428,6 @@ class NaverAdsAPI:
             return None, f"응답 파싱 오류: {e}"
 
     def get_keyword_stats(self, keyword):
-        """기존 메서드 - 수정하지 않음. (통계 dict 또는 None, 에러메시지) 튜플 반환."""
         lst, err = self._fetch_keywordstool(keyword)
         if lst is None:
             return None, err
@@ -441,30 +451,13 @@ class NaverAdsAPI:
         comp = top.get("compIdx", "낮음")
         return {"pc": pc, "mobile": mobile, "total": pc + mobile, "comp_idx": comp}, None
 
-    # ----------------------------------------------------------------
-    # [scorer.py 호환 메서드] get_search_volume(keyword) -> int
-    # ----------------------------------------------------------------
     def get_search_volume(self, keyword):
-        """
-        scorer.py 호환 인터페이스.
-        해당 키워드의 월간 PC+모바일 검색량 합계(int)를 직접 반환하며,
-        조회 실패 시 예외를 발생시킨다.
-        """
         stats, err = self.get_keyword_stats(keyword)
         if stats is None:
             raise Exception(err or "검색량 조회 실패")
         return stats.get("total", 0)
 
-    # ----------------------------------------------------------------
-    # [scorer.py 호환 메서드] get_related_keywords(keyword, limit) -> list[dict]
-    # ----------------------------------------------------------------
     def get_related_keywords(self, keyword, limit=30):
-        """
-        scorer.py 호환 인터페이스.
-        연관검색어 목록을 [{"keyword": str, "total_volume": int}, ...] 형태로 반환한다.
-        원본 키워드 자기 자신 행과 검색량 0인 항목은 제외하고, 검색량 내림차순 상위 limit개만 반환한다.
-        조회 자체가 실패하면(네트워크/인증 오류) 예외를 발생시킨다.
-        """
         lst, err = self._fetch_keywordstool(keyword)
         if lst is None:
             raise Exception(err or "연관검색어 조회 실패")
