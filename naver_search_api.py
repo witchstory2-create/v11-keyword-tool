@@ -1,41 +1,46 @@
 # -*- coding: utf-8 -*-
 """
-naver_search_api.py (v18.6)
+naver_search_api.py (v18.7)
 ----------------------------------------------------
-네이버 API 3종 래퍼 + 개별 연결 테스트 + scorer.py 호환 메서드
+네이버 API 3종 래퍼 + 개별 연결 테스트 + collector.py/scorer.py 호환 메서드
 
 [이 파일의 역할]
-1) NaverSearchAPI   : 검색 Open API (블로그/뉴스 문서수 조회) -> scorer.py가 사용
+1) NaverSearchAPI   : 검색 Open API (뉴스 수집 / 블로그 문서수 조회)
+                      -> collector.py, scorer.py가 사용
 2) NaverDataLabAPI  : 데이터랩 검색어트렌드 (DataLab 상승률 조회) -> scorer.py가 사용
 3) NaverAdsAPI      : 검색광고 API (검색량/연관검색어/경쟁도 조회) -> scorer.py가 사용
 
 [이 파일이 하지 않는 일]
-- 뉴스 수집, 후보 추출 -> collector.py
+- 후보 추출, 노이즈 제거 -> collector.py
 - 수익형 필터링, 카테고리 가중치 -> profit_filter.py
 - 점수 계산, 등급 분류 -> scorer.py
 - 화면 표시 -> app.py
 
-[v18.6 변경 사항 - scorer.py 호환성 추가]
-기존 저수준 메서드(_search_total, get_keyword_stats, get_spike_ratio 등)는
-전혀 수정하지 않고 그대로 유지했다. 다만 scorer.py의 _safe_call()은
-"함수가 값을 직접 반환하거나, 실패 시 예외를 던진다"는 방식을 기대하는데
-기존 메서드들은 모두 (값, 에러메시지) 튜플을 반환하므로 서로 맞지 않는다.
-그래서 아래 4개의 "얇은 래퍼 메서드"를 새로 추가해 이 간극을 메웠다.
+[v18.7 변경 사항 - collector.py 호환성 추가]
+기존 저수준 메서드/진단 로직(_http_get, _http_post_json, _diagnose,
+test_connection 3종, _search_total, get_news_doc_count, get_trend,
+get_spike_ratio, get_keyword_stats, _signature, _headers 등)은
+전혀 수정하지 않고 그대로 유지했다.
 
-    - NaverSearchAPI.get_blog_doc_count(keyword)      -> int 직접 반환 / 실패 시 예외
-    - NaverAdsAPI.get_search_volume(keyword)          -> int 직접 반환 / 실패 시 예외
-    - NaverAdsAPI.get_related_keywords(keyword, limit)-> list[dict] 직접 반환 / 실패 시 예외
-    - NaverDataLabAPI.get_trend_ratio(keyword)         -> float 직접 반환 / 실패 시 예외
+이번에 새로 추가된 것은 다음 5개 메서드뿐이다.
 
-이 래퍼들이 던지는 예외는 scorer.py의 _safe_call이 잡아서 ApiHealthTracker에
-실패로 기록하므로, app.py 상단의 API 상태 표시등(검색/광고/DataLab)이 분석 실행
-중 실제 호출 성공/실패를 정확히 반영하게 된다.
+    - NaverSearchAPI.search_news(query, display, start, sort)
+        -> collector.py의 _fetch_seed_news()가 호출하는 뉴스 검색 메서드.
+           반환 형식: [{"title":"", "description":"", "link":"",
+                        "originallink":"", "pubDate":""}, ...]
+           (v18.6에서 이 메서드가 누락되어 있어 collector.py가 모든 시드
+            쿼리에서 조용히 실패, 최종 결과가 항상 0건이 되는 문제가 있었음)
 
-주의: get_blog_doc_count(keyword)는 원래도 이 이름으로 존재하던 메서드였으나,
-파일 상단 주석에 이미 "scorer.py가 사용"이라고 명시되어 있었으므로 이번에
-반환 방식만 scorer.py 호환 형태(int 직접 반환/실패 시 예외)로 바꾸었다.
-기존에 튜플 반환 방식에 의존하는 다른 코드가 있다면 알려주시면 별도 메서드명으로
-분리해 드리겠습니다.
+    - NaverSearchAPI.get_blog_doc_count(query)      -> scorer.py 호환 (v18.6에서 추가)
+    - NaverAdsAPI.get_search_volume(keyword)        -> scorer.py 호환 (v18.6에서 추가)
+    - NaverAdsAPI.get_related_keywords(keyword, limit) -> scorer.py 호환 (v18.6에서 추가)
+    - NaverDataLabAPI.get_trend_ratio(keyword)      -> scorer.py 호환 (v18.6에서 추가)
+
+get_blog_doc_count/get_search_volume/get_related_keywords/get_trend_ratio는
+값을 직접 반환하고 실패 시 예외를 던지는 방식이며, search_news도 동일하게
+실패 시 예외를 던진다. collector.py의 _fetch_seed_news()는 이 예외를
+try/except로 잡아 로그에만 남기고 안전하게 다음 시드로 넘어가도록 이미
+설계되어 있으므로 이 파일에서 별도의 방어 로직을 추가하지 않았다.
 
 표준 라이브러리만 사용 (urllib.request, hmac, hashlib, base64) -> requests 등 외부 패키지 불필요,
 PyInstaller onefile 빌드에 안전.
@@ -143,7 +148,7 @@ def _to_int(v):
 
 
 # ------------------------------------------------------------------
-# 1) 네이버 검색 API (Open API) - 문서수 조회
+# 1) 네이버 검색 API (Open API) - 뉴스 수집 / 문서수 조회
 # ------------------------------------------------------------------
 class NaverSearchAPI:
     def __init__(self, client_id, client_secret):
@@ -190,6 +195,61 @@ class NaverSearchAPI:
     def get_news_doc_count(self, query):
         """기존 메서드 - 수정하지 않음. (총 문서수, 에러메시지) 튜플 반환."""
         return self._search_total("news", query)
+
+    # ----------------------------------------------------------------
+    # [collector.py 호환 메서드] search_news(query, display, start, sort)
+    # ----------------------------------------------------------------
+    def search_news(self, query, display=100, start=1, sort="date"):
+        """
+        collector.py의 _fetch_seed_news()가 호출하는 뉴스 검색 메서드.
+        네이버 뉴스 검색 Open API(/v1/search/news.json)를 호출해 기사 목록을 반환한다.
+
+        반환 형식:
+            [
+                {
+                    "title": str,
+                    "description": str,
+                    "link": str,
+                    "originallink": str,
+                    "pubDate": str,
+                },
+                ...
+            ]
+
+        display는 네이버 API 정책상 최대 100, start는 최대 1000까지만 허용되므로
+        해당 범위를 넘는 값은 자동으로 잘라낸다(clamp).
+        조회 실패 시 예외를 발생시키며, collector.py는 이를 try/except로 잡아
+        로그에만 남기고 다음 시드로 안전하게 넘어가도록 이미 설계되어 있다.
+        """
+        display = max(1, min(int(display), 100))
+        start = max(1, min(int(start), 1000))
+
+        params = urllib.parse.urlencode({
+            "query": query,
+            "display": display,
+            "start": start,
+            "sort": sort,
+        })
+        url = "https://openapi.naver.com/v1/search/news.json?" + params
+        status, body = _http_get(url, headers=self._headers())
+        if status != 200:
+            raise Exception(_diagnose(status, body, "search"))
+        try:
+            j = json.loads(body)
+        except Exception as e:
+            raise Exception(f"응답 파싱 오류: {e}")
+
+        items = j.get("items", [])
+        result = []
+        for item in items:
+            result.append({
+                "title": item.get("title", ""),
+                "description": item.get("description", ""),
+                "link": item.get("link", ""),
+                "originallink": item.get("originallink", ""),
+                "pubDate": item.get("pubDate", ""),
+            })
+        return result
 
     # ----------------------------------------------------------------
     # [scorer.py 호환 메서드] get_blog_doc_count(keyword) -> int
