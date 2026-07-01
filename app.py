@@ -101,7 +101,7 @@ def run_analysis():
     root.after(0, finalize)
 
 
-# ---------------------- 제목 생성 ----------------------
+# ---------------------- 제목/개요 상세 보기 ----------------------
 
 def show_titles():
     selected = tree.selection()
@@ -136,7 +136,7 @@ def render_keyword_detail(keyword):
 
 def run_gpt_writing(keyword, outline):
     api_key = gpt_key_entry.get().strip() or None
-    status.config(text="GPT로 글 작성 중...")
+    status.config(text="글 작성 중...")
     root.update()
     draft = write_draft(keyword, outline, api_key)
     detail_box.insert(tk.END, "\n[글 초안]\n" + draft + "\n")
@@ -240,7 +240,7 @@ root.geometry("1400x820")
 title_label = tk.Label(root, text="v16 이슈 수익형 블로그 글 추천기", font=("맑은 고딕", 17, "bold"))
 title_label.pack(pady=8)
 
-api_frame = tk.LabelFrame(root, text="네이버 검색광고 API / GPT 설정")
+api_frame = tk.LabelFrame(root, text="네이버 검색광고 API / Gemini 설정")
 api_frame.pack(fill="x", padx=15, pady=5)
 
 tk.Label(api_frame, text="CUSTOMER_ID").grid(row=0, column=0, padx=5, pady=5)
@@ -255,9 +255,15 @@ tk.Label(api_frame, text="SECRET_KEY").grid(row=0, column=4, padx=5, pady=5)
 secret_entry = tk.Entry(api_frame, width=35, show="*")
 secret_entry.grid(row=0, column=5, padx=5, pady=5)
 
-tk.Label(api_frame, text="GPT API KEY (선택)").grid(row=1, column=0, padx=5, pady=5)
+tk.Label(api_frame, text="Gemini API KEY (선택, 무료 발급 가능)").grid(row=1, column=0, padx=5, pady=5)
 gpt_key_entry = tk.Entry(api_frame, width=45, show="*")
 gpt_key_entry.grid(row=1, column=1, columnspan=3, padx=5, pady=5, sticky="w")
+
+tk.Label(
+    api_frame,
+    text="※ https://aistudio.google.com/apikey 에서 무료로 발급 (결제 등록 안 하면 과금 없음)",
+    fg="gray40", font=("맑은 고딕", 8)
+).grid(row=2, column=0, columnspan=4, padx=5, pady=2, sticky="w")
 
 button_frame = tk.Frame(root)
 button_frame.pack(pady=8, fill="x", padx=15)
@@ -268,7 +274,7 @@ analyze_button.pack(side="left", padx=5)
 title_button = tk.Button(button_frame, text="선택 키워드 상세 보기", command=show_titles, width=20)
 title_button.pack(side="left", padx=5)
 
-gpt_button = tk.Button(button_frame, text="GPT로 글쓰기", state="disabled", width=15)
+gpt_button = tk.Button(button_frame, text="글 초안 생성 (Gemini)", state="disabled", width=18)
 gpt_button.pack(side="left", padx=5)
 
 tk.Button(button_frame, text="클립보드 복사", command=copy_to_clipboard, width=14).pack(side="left", padx=5)
