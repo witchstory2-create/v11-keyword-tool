@@ -1,24 +1,15 @@
 # scorer.py
-# v16.5 - 실질 애드포스트 수익 추정 기반 스코어러
+# v16.6 - 실제 광고 경쟁도(plAvgDepth) 및 실측 CTR 기반 수익 추정
 # 변경 사항(2026-07):
-#   1) profit_score를 "검색량+카테고리"의 대략적 조합이 아니라
-#      "실제로 이 글을 쓰면 한 달에 몇 원 정도 벌릴 것인가"를 직접 추정하는 방식으로 전환
-#   2) 검색량을 그대로 쓰지 않고, 키워드 구체성(word_count/is_generic)에 따라
-#      다른 지수(alpha)로 감쇠시켜 "신규 블로그가 실제로 받을 수 있는 유입"을 근사
-#      (compIdx는 검색광고 입찰 경쟁도라 블로그 SEO 경쟁도와 다르므로 보조 지표로만 사용)
-#   3) 카테고리별 실제 CPC(원) 추정치를 곱해 예상 월수익(원)을 산출
-#   4) 이 예상 월수익을 로그 스케일로 압축해 profit_score로 사용
+#   1) 카테고리 고정 CPC 대신, 네이버 API가 무료로 제공하는 plAvgDepth(평균 광고 노출 개수)를
+#      배율로 사용해 "검색량은 적어도 광고주 경쟁이 치열한 키워드"의 실제 CPC를 더 높게 추정
+#      -> 조회수가 낮아도 수익이 높게 나올 수 있는 현상을 반영
+#   2) 임의로 고정했던 2% 클릭률 대신, API가 돌려주는 실측 CTR(monthlyAvePcCtr/MobileCtr)을
+#      우선 사용하고, 값이 없을 때만 2%를 기본값으로 사용
+#   3) 추천 이유에 "조회수는 낮지만 광고 경쟁 치열 -> 실제 단가 높을 가능성" 문구 추가
 
 import math
 
-# ---------------------------------------------------------------
-# 1. 키워드 구체성에 따른 "실질 유입 감쇠 지수"와 "트래픽 포착률"
-#    - generic: '대출','환급','보험' 등 범용 단일어. 이미 대형 매체/파워블로거가
-#      상위를 점유하고 있어 검색량이 커도 신규 글의 실제 유입은 극히 일부에 불과함.
-#    - specific_single: '피해지원금'처럼 압축된 한 단어 고유명사.
-#    - multiword: '고유가 피해지원금'처럼 2단어 이상 구체적 문구. 경쟁이 상대적으로
-#      약해 검색량 증가가 실질 유입 증가로 거의 그대로 이어짐.
-# ---------------------------------------------------------------
 EXPONENT_BY_SPECIFICITY = {
     "generic": 0.30,
     "specific_single": 0.60,
@@ -31,14 +22,11 @@ TRAFFIC_CAPTURE_RATE = {
     "multiword": 0.3,
 }
 
-# 방문자 중 실제로 광고를 클릭하는 비율 (업계 평균 1~3% 참고치)
-AD_CLICK_RATE = 0.02
+# API에 실측 CTR이 없을 때만 사용하는 기본 클릭률
+DEFAULT_AD_CLICK_RATE = 0.02
 
-# ---------------------------------------------------------------
-# 2. 카테고리별 실제 CPC(원) 추정치
-#    ※ 실측 데이터가 아니라 블로거들이 공개한 애드포스트 수익 사례를 참고한
-#      근사값입니다. 절대 수치가 아니라 카테고리 간 "상대적 우선순위"로 활용하세요.
-# ---------------------------------------------------------------
+# 카테고리별 "기본" CPC(원) 추정치. 여기에 plAvgDepth 배율을 곱해 실제 단가를 보정한다.
+# ※ 실측 데이터가 아니라 상대적 우선순위를 위한 근사값입니다.
 CATEGORY_CPC_KRW = {
     "보험": 100,
     "대출": 80,
@@ -50,7 +38,12 @@ CATEGORY_CPC_KRW = {
 }
 
 MONEY_CATEGORY_KEYWORDS = list(CATEGORY_CPC_KRW.keys())
-DEFAULT_CPC_KRW = 15  # 매칭 안 되는 기타 카테고리
+DEFAULT_CPC_KRW = 15
+
+# plAvgDepth(평균 광고 노출 개수)를 CPC 배율로 변환할 때 사용하는 정규화 기준
+# depth가 이 값과 같으면 배율 1.0, 이보다 크면 배율이 커지고 최대 AD_DEPTH_MAX_MULTIPLIER로 캡
+AD_DEPTH_BASELINE = 3.0
+AD_DEPTH_MAX_MULTIPLIER = 4.0
 
 NON_MONEY_PROFIT_CAP = 8.0
 NEW_ISSUE_MENTION_THRESHOLD = 4
@@ -77,7 +70,6 @@ def _get_issue_weight(candidate: dict) -> float:
 
 
 def _apply_relkeyword_discount(candidate: dict, naver_data: dict) -> float:
-    """네이버 API의 relKeyword가 시드 키워드를 포함하지 않으면 관련성이 낮다고 보고 할인"""
     seed = candidate["keyword"]
     rel_keyword = naver_data.get("relKeyword", seed) if naver_data else seed
     if seed not in rel_keyword:
@@ -92,41 +84,65 @@ def _calculate_issue_score(candidate: dict, naver_data: dict) -> float:
     return round(math.log2(adjusted_mentions + 1) * 10, 2)
 
 
+def _get_ad_depth_multiplier(naver_data: dict) -> float:
+    """
+    plAvgDepth(평균 파워링크 광고 노출 개수)가 높을수록 광고주 경쟁이 치열하다는 뜻이고,
+    이는 실제 CPC가 카테고리 평균보다 훨씬 높을 가능성을 의미한다.
+    검색량이 적어도 이 값이 높으면 수익 추정치를 끌어올려 준다.
+    """
+    depth = float(naver_data.get("plAvgDepth", 0) or 0)
+    multiplier = 1.0 + (depth / AD_DEPTH_BASELINE)
+    return min(multiplier, AD_DEPTH_MAX_MULTIPLIER)
+
+
+def _get_effective_click_rate(naver_data: dict) -> float:
+    """API가 돌려준 실측 CTR을 우선 사용하고, 없으면 기본값(2%)을 사용"""
+    ctr_pc = float(naver_data.get("monthlyAvePcCtr", 0) or 0)
+    ctr_mobile = float(naver_data.get("monthlyAveMobileCtr", 0) or 0)
+    ctr_values = [c for c in (ctr_pc, ctr_mobile) if c > 0]
+    if not ctr_values:
+        return DEFAULT_AD_CLICK_RATE
+    avg_ctr_percent = sum(ctr_values) / len(ctr_values)
+    return avg_ctr_percent / 100.0
+
+
 def estimate_monthly_revenue(candidate: dict, naver_data: dict) -> dict:
-    """
-    실제로 이 키워드로 글을 썼을 때 한 달에 대략 몇 원의 애드포스트 수익이
-    날 것인지 추정한다. 검색량을 그대로 쓰지 않고, 키워드 구체성에 따라
-    감쇠시켜 '신규 블로그가 실제로 받을 수 있는 유입'을 근사한다.
-    """
     pc_count = int(naver_data.get("monthlyPcQcCnt", 0) or 0)
     mobile_count = int(naver_data.get("monthlyMobileQcCnt", 0) or 0)
     total_search = pc_count + mobile_count
 
     category = _detect_category(candidate["keyword"])
     is_money_category = category != "기타"
-    cpc_krw = CATEGORY_CPC_KRW.get(category, DEFAULT_CPC_KRW)
+    base_cpc = CATEGORY_CPC_KRW.get(category, DEFAULT_CPC_KRW)
+
+    ad_depth_multiplier = _get_ad_depth_multiplier(naver_data)
+    cpc_estimate = base_cpc * ad_depth_multiplier
+    click_rate = _get_effective_click_rate(naver_data)
 
     tier = _get_specificity_tier(candidate)
     alpha = EXPONENT_BY_SPECIFICITY[tier]
     capture_rate = TRAFFIC_CAPTURE_RATE[tier]
 
     new_issue_special_case = False
+    low_search_high_value = False
 
     if total_search > 0:
         effective_demand = total_search ** alpha
         estimated_visits = effective_demand * capture_rate
+        # 검색량은 적은데(1000 미만) 광고 경쟁도가 높으면 "숨은 고수익 키워드" 신호로 표시
+        if total_search < 1000 and ad_depth_multiplier >= 1.8:
+            low_search_high_value = True
     else:
-        # 검색량 0: 신규 이슈라 데이터 미반영일 가능성 -> 뉴스 언급량으로 대체 추정
         if candidate["mentions"] >= NEW_ISSUE_MENTION_THRESHOLD and is_money_category:
             new_issue_special_case = True
-            proxy_demand = candidate["mentions"] * 10  # 언급량을 검색량 대용으로 환산(러프한 추정)
+            proxy_demand = candidate["mentions"] * 10
             effective_demand = proxy_demand ** alpha
             estimated_visits = effective_demand * capture_rate
         else:
-            estimated_visits = 0.5  # 거의 죽은 키워드
+            estimated_visits = 0.5
 
-    estimated_clicks = estimated_visits * AD_CLICK_RATE
-    estimated_revenue_krw = estimated_clicks * cpc_krw
+    estimated_clicks = estimated_visits * click_rate
+    estimated_revenue_krw = estimated_clicks * cpc_estimate
 
     return {
         "category": category,
@@ -135,13 +151,15 @@ def estimate_monthly_revenue(candidate: dict, naver_data: dict) -> dict:
         "mobile": mobile_count,
         "estimated_visits": round(estimated_visits, 1),
         "estimated_revenue_krw": round(estimated_revenue_krw, 1),
+        "ad_depth_multiplier": round(ad_depth_multiplier, 2),
+        "click_rate_used": round(click_rate * 100, 2),  # %로 표시
         "new_issue_special_case": new_issue_special_case,
+        "low_search_high_value": low_search_high_value,
         "tier": tier,
     }
 
 
 def _calculate_profit_score(revenue_info: dict) -> float:
-    """예상 월수익(원)을 로그 스케일로 압축해 issue_score와 비슷한 범위의 점수로 변환"""
     raw = math.log2(revenue_info["estimated_revenue_krw"] + 1) * 10
     if not revenue_info["is_money_category"]:
         raw = min(raw, NON_MONEY_PROFIT_CAP)
@@ -172,6 +190,11 @@ def _build_reason_checklist(candidate: dict, revenue_info: dict) -> list:
     revenue_text = f"예상 월수익 약 {revenue_info['estimated_revenue_krw']:,.0f}원 (추정, 실제와 다를 수 있음)"
     reasons.append(revenue_text)
 
+    if revenue_info.get("low_search_high_value"):
+        reasons.append(
+            f"⭐ 조회수는 낮지만 광고 경쟁도 높음(배율 x{revenue_info['ad_depth_multiplier']}) "
+            "- 실제 단가가 높아 숨은 고수익 키워드일 가능성"
+        )
     if candidate["mentions"] >= 5 and not candidate.get("is_generic"):
         reasons.append("뉴스 언급 증가")
     if candidate.get("word_count", 1) >= 2:
@@ -191,7 +214,6 @@ def _categorize(final_score: float, issue_score: float, profit_score: float,
                  is_money_category: bool, is_generic: bool) -> str:
     if not is_money_category:
         return "비수익(제외권장)"
-    # HOT 이슈는 '오늘의 이슈'라는 신선도가 핵심이므로 범용 상시 키워드는 제외
     if issue_score >= 25 and profit_score >= 40 and not is_generic:
         return "HOT 이슈"
     if profit_score >= 45:
@@ -230,13 +252,14 @@ def score_keyword(candidate: dict, naver_data: dict = None) -> dict:
         "is_money_category": revenue_info["is_money_category"],
         "estimated_revenue_krw": revenue_info["estimated_revenue_krw"],
         "estimated_visits": revenue_info["estimated_visits"],
+        "ad_depth_multiplier": revenue_info["ad_depth_multiplier"],
+        "low_search_high_value": revenue_info["low_search_high_value"],
         "new_issue_special_case": revenue_info["new_issue_special_case"],
         "reasons": reasons,
     }
 
 
 def filter_top5(scored_keywords: list) -> list:
-    """비수익 키워드를 제외하고 예상 수익(final_score) 기준 상위 5개 반환"""
     money_only = [k for k in scored_keywords if k["is_money_category"]]
     money_only.sort(key=lambda x: x["final_score"], reverse=True)
     return money_only[:5]
