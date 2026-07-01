@@ -1,32 +1,22 @@
 # -*- coding: utf-8 -*-
 """
-naver_search_api.py (v18.8)
+naver_search_api.py (v18.9)
 ----------------------------------------------------
 네이버 API 3종 래퍼 + 개별 연결 테스트 + collector.py/scorer.py 호환 메서드
 
-[v18.7에서 유지된 것]
+[v18.8에서 유지된 것]
 - NaverSearchAPI.search_news(), get_blog_doc_count()
 - NaverAdsAPI.get_search_volume(), get_related_keywords()
 - NaverDataLabAPI.get_trend_ratio()
 - 모든 저수준 진단/연결테스트 로직(_diagnose, test_connection 3종 등)
+- 429/timeout 재시도 로직(_http_get_retry, _http_post_json_retry)
 
-[v18.8 변경 사항 - API 과호출(429) / 응답지연(timeout) 대응]
-문서수 조회(429 다발)와 DataLab 조회(read timeout 다발)에서 실패가
-곧바로 예외로 이어져 scorer.py 단계에서 대량 탈락이 발생하던 문제를
-해결하기 위해, 아래 두 지점에만 재시도/백오프를 추가했다.
-
-    1) NaverSearchAPI._search_total() (get_blog_doc_count, get_news_doc_count가 사용)
-       -> 429 발생 시 2초 -> 5초 -> 10초 순서로 대기 후 최대 3회 재시도
-       -> timeout 발생 시 1초 대기 후 최대 2회 재시도
-
-    2) NaverDataLabAPI.get_trend()  (get_spike_ratio, get_trend_ratio가 사용)
-       -> 위와 동일한 429/timeout 재시도 정책 적용
-       -> HTTP 타임아웃 값을 6초 -> 12초로 상향 (DataLab 응답 지연 대응)
-
-그 외 메서드(test_connection, search_news, get_search_volume,
-get_related_keywords 등)는 전혀 수정하지 않았다. 재시도는 200/401/403/404
-등 재시도해도 결과가 바뀌지 않는 상태코드에는 적용되지 않고, 오직
-429(호출 한도 초과)와 timeout(응답 지연)에만 적용된다.
+[v18.9 변경 사항 - app.py 연동용 재시도 통계 노출]
+app.py가 분석 시작/종료 시점에 429·timeout 발생 횟수를 확인할 수 있도록
+모듈 최상위에 reset_retry_stats() / get_retry_stats() 두 함수만 추가했다.
+기존 함수/클래스는 전혀 수정하지 않았고, 재시도가 실제로 발생하는
+_http_get_retry / _http_post_json_retry 내부에서 카운터를 증가시키는
+코드만 끼워넣었다(반환값 형식은 동일하게 유지).
 
 표준 라이브러리만 사용 (urllib.request, hmac, hashlib, base64) -> requests 등 외부 패키지 불필요,
 PyInstaller onefile 빌드에 안전.
@@ -37,9 +27,40 @@ import time
 import hmac
 import hashlib
 import base64
+import threading
 import urllib.request
 import urllib.parse
 import urllib.error
+
+
+# ------------------------------------------------------------------
+# [v18.9 신규] 429 / timeout 재시도 통계 (모듈 최상위, 스레드-세이프)
+# ------------------------------------------------------------------
+_retry_stats_lock = threading.Lock()
+_retry_stats = {"count_429": 0, "count_timeout": 0}
+
+
+def reset_retry_stats():
+    """분석 시작 시 호출: 누적된 429 / timeout 재시도 카운터를 0으로 초기화한다."""
+    with _retry_stats_lock:
+        _retry_stats["count_429"] = 0
+        _retry_stats["count_timeout"] = 0
+
+
+def get_retry_stats():
+    """분석 종료 후 호출: 누적된 429 / timeout 재시도 횟수를 dict로 반환한다."""
+    with _retry_stats_lock:
+        return dict(_retry_stats)
+
+
+def _record_429():
+    with _retry_stats_lock:
+        _retry_stats["count_429"] += 1
+
+
+def _record_timeout():
+    with _retry_stats_lock:
+        _retry_stats["count_timeout"] += 1
 
 
 def _http_get(url, headers=None, timeout=6):
@@ -85,7 +106,7 @@ def _http_post_json(url, payload, headers=None, timeout=6):
 
 
 # ------------------------------------------------------------------
-# [v18.8 신규] 429 / timeout 재시도 래퍼
+# 429 / timeout 재시도 래퍼
 # ------------------------------------------------------------------
 def _sleep_backoff_429(attempt):
     """429 재시도 대기 시간: 1회차 2초, 2회차 5초, 3회차(이후) 10초."""
@@ -105,16 +126,19 @@ def _http_get_retry(url, headers=None, timeout=6, max_429_retries=3, max_timeout
     """
     _http_get을 감싸 429(호출 한도 초과)와 timeout(응답 지연) 상황에서만 재시도한다.
     200/401/403/404 등 재시도해도 결과가 바뀌지 않는 상태코드는 즉시 그대로 반환한다.
+    [v18.9] 재시도가 실제로 발생할 때마다 모듈 최상위 통계(_retry_stats)를 증가시킨다.
     """
     tries_429 = 0
     tries_timeout = 0
     while True:
         status, body = _http_get(url, headers=headers, timeout=timeout)
         if status == 429 and tries_429 < max_429_retries:
+            _record_429()
             _sleep_backoff_429(tries_429)
             tries_429 += 1
             continue
         if _is_timeout_error(status, body) and tries_timeout < max_timeout_retries:
+            _record_timeout()
             time.sleep(1.0)
             tries_timeout += 1
             continue
@@ -122,15 +146,18 @@ def _http_get_retry(url, headers=None, timeout=6, max_429_retries=3, max_timeout
 
 
 def _http_post_json_retry(url, payload, headers=None, timeout=10, max_429_retries=3, max_timeout_retries=2):
+    """[v18.9] 재시도가 실제로 발생할 때마다 모듈 최상위 통계(_retry_stats)를 증가시킨다."""
     tries_429 = 0
     tries_timeout = 0
     while True:
         status, body = _http_post_json(url, payload, headers=headers, timeout=timeout)
         if status == 429 and tries_429 < max_429_retries:
+            _record_429()
             _sleep_backoff_429(tries_429)
             tries_429 += 1
             continue
         if _is_timeout_error(status, body) and tries_timeout < max_timeout_retries:
+            _record_timeout()
             time.sleep(1.0)
             tries_timeout += 1
             continue
@@ -220,7 +247,7 @@ class NaverSearchAPI:
 
     def _search_total(self, kind, query):
         """
-        [v18.8 수정] 429/timeout 재시도 래퍼(_http_get_retry) 적용.
+        429/timeout 재시도 래퍼(_http_get_retry) 적용.
         기존 반환 형식((총 문서수, 에러메시지) 튜플)은 그대로 유지했다.
         """
         url = "https://openapi.naver.com/v1/search/%s.json?query=%s&display=1" % (
@@ -276,7 +303,7 @@ class NaverSearchAPI:
     def get_blog_doc_count(self, query):
         """
         scorer.py 호환 인터페이스.
-        [v18.8] _search_total 내부에 재시도가 적용되어 429/timeout에 더 강해졌다.
+        _search_total 내부에 재시도가 적용되어 429/timeout에 더 강해졌다.
         """
         count, err = self._search_total("blog", query)
         if count is None:
@@ -311,7 +338,7 @@ class NaverDataLabAPI:
 
     def get_trend(self, keyword, days=30):
         """
-        [v18.8 수정] timeout 6초 -> 12초 상향, 429/timeout 재시도 래퍼 적용.
+        timeout 6초 -> 12초 상향, 429/timeout 재시도 래퍼 적용.
         반환 형식((일별 데이터 리스트, 에러메시지) 튜플)은 그대로 유지했다.
         """
         import datetime
@@ -360,7 +387,7 @@ class NaverDataLabAPI:
     def get_trend_ratio(self, keyword, days=30, recent_days=3):
         """
         scorer.py 호환 인터페이스.
-        [v18.8] get_trend 내부 재시도/timeout 상향이 적용되어 이전보다 timeout 실패가 줄어든다.
+        get_trend 내부 재시도/timeout 상향이 적용되어 이전보다 timeout 실패가 줄어든다.
         여전히 실패하면 예외를 던지며, scorer.py는 이 경우 중립값(1.0)으로 대체 처리한다.
         """
         ok, ratio, err = self.get_spike_ratio(keyword, days=days, recent_days=recent_days)
