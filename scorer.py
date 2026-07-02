@@ -1,12 +1,33 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v19.3)
+scorer.py (v19.4)
 네이버 블로그 수익형 키워드 발굴 시스템 - 검증/확장/점수화/등급분류 통합 엔진
 
 [파이프라인 내 위치]
   collector.collect_candidates() -> profit_filter.filter_candidates() -> scorer.score_candidates()
 
-[v19.3 변경 사항 - 1단계(검색량)/2단계(연관검색어) ads API 429 대응]
+[v19.4 변경 사항 - 효율(efficiency) 표시 버그 수정 (최소 수정)]
+
+  문제: 문서수(doc_count)를 확인하지 못한 보류 키워드의 경우, 기존
+  _compute_efficiency()가 doc_count=None을 0으로 치환한 뒤 나눗셈을 수행해
+  결과적으로 "검색량 / 1" 즉 검색량 값 그대로가 효율로 계산되는 버그가
+  있었다. 예를 들어 검색량 4,460 / 문서수 미확인 키워드의 효율이 4460.00으로
+  표시되는 등, 문서수를 확인하지 못했는데도 마치 매우 효율이 좋은 키워드처럼
+  잘못 보이는 문제가 있었다.
+
+  수정 내용:
+    1) _compute_efficiency(): doc_count가 None이면 계산을 하지 않고 0.0을
+       반환한다. (더 이상 doc_count를 0으로 치환해 나누지 않음)
+    2) 5단계 점수 계산 루프에 entry["efficiency_unknown"] = (doc_count is None)
+       필드를 추가한다. 이 값은 app.py가 화면에 효율을 "-" 또는 "확인 불가"로
+       표시할지를 판단하는 근거로 사용된다.
+
+  FinalScore 계산에는 efficiency(원시값)가 직접 쓰이지 않고 별도의
+  efficiency_score와 중립값(EFFICIENCY_NEUTRAL_FOR_UNKNOWN_DOC=3.0)이 쓰이므로,
+  이번 수정은 점수 계산/등급 분류/API 호출 로직에는 전혀 영향을 주지 않는다.
+  이 외의 로직은 v19.3과 완전히 동일하다.
+
+[이하 v19.3의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
 
   원인: 로그 분석 결과 429 에러는 3단계(문서수, search API)가 아니라
   1단계(검색량 확인)와 2단계(연관검색어 확장) - 즉 ads API 호출 단계에서
@@ -40,14 +61,10 @@ scorer.py (v19.3)
     8) 로그에 1단계/2단계 각각 확인 대상, 성공/실패, 조기중단 여부와
        실패율을 상세히 출력한다.
     9) score_candidates()의 반환 형태((results, api_health) 튜플)와
-       기존 필드는 모두 유지한다. 신규 필드(volume_api_failed,
-       volume_check_skipped, volume_call_aborted)는 비파괴적 추가이므로
-       app.py 수정 없이 동작한다.
+       기존 필드는 모두 유지한다.
 
   3단계(문서수) 조기중단 로직(v19.2), 점수 가중치/페널티 구조(v19) 등
   이 외의 로직은 이번 단계에서 변경하지 않았다.
-
-[이하 v19의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
 
   이전 버전(v18.8)의 한계: OpportunityScore가 log(검색량)/log(문서수) 비율
   기반이라, 검색량 자체가 매우 큰 키워드는 비율상 여전히 높은 점수를 받아
@@ -74,6 +91,7 @@ scorer.py (v19.3)
   - 신규 추가 필드(비파괴적 추가, v19.2): doc_call_aborted (bool)
   - 신규 추가 필드(비파괴적 추가, v19.3): volume_api_failed (bool),
     volume_check_skipped (bool), volume_call_aborted (bool)
+  - 신규 추가 필드(비파괴적 추가, v19.4): efficiency_unknown (bool)
 
 표준 라이브러리만 사용 (math, time, random, threading, datetime, concurrent.futures)
 -> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
@@ -104,13 +122,13 @@ TOP5_SIZE = 5
 TOP10_SIZE = 10                 # TOP5 이후 순위 6~15
 MAX_WORKERS = 2                 # 1단계(검색량)/2단계(연관검색어) 병렬 수 (v19.3: 4 -> 2, 429 심하면 1로 낮출 것)
 
-# [v19.3 신규] 1단계 검색량 확인 대상 제한 및 429 조기중단 파라미터
+# [v19.3] 1단계 검색량 확인 대상 제한 및 429 조기중단 파라미터
 SEARCH_VOLUME_CHECK_LIMIT = 250     # mentions/intent_score/category_weight 상위 250건만 실제 ads API 호출
 VOLUME_CALL_BATCH_SIZE = 20         # 이 단위로 나눠서 조회하며 배치마다 실패율을 점검한다
 VOLUME_CALL_ABORT_MIN_ATTEMPTS = 10 # 최소 이만큼 시도한 뒤부터 중단 여부를 판단한다
 VOLUME_CALL_ABORT_FAIL_RATE = 0.3   # 누적 실패율이 이 값 이상이면 1단계 조회를 중단한다
 
-# [v19.3 신규] 2단계 연관검색어 확장 429 조기중단 파라미터
+# [v19.3] 2단계 연관검색어 확장 429 조기중단 파라미터
 RELATED_CALL_BATCH_SIZE = 10        # 대표 후보 수가 적으므로 문서수/검색량보다 작은 배치 단위 사용
 RELATED_CALL_ABORT_MIN_ATTEMPTS = 5
 RELATED_CALL_ABORT_FAIL_RATE = 0.3
@@ -262,15 +280,15 @@ class _KeywordCache:
 # =========================================================================
 def _fetch_volume_one(ads_api, keyword, tracker, log, cache):
     """
-    [v19.3] 반환값의 두 번째 요소는 int(검색량) 또는 None(API 호출 실패)이다.
-    과거에는 실패 시 0으로 치환해 진짜 저검색량과 구분하지 못했는데,
-    이제는 None으로 명확히 구분해서 상위에서 "보류" 처리할 수 있게 한다.
+    반환값의 두 번째 요소는 int(검색량) 또는 None(API 호출 실패)이다.
+    실패 시 0으로 치환하지 않고 None으로 명확히 구분해서 상위에서
+    "보류" 처리할 수 있게 한다.
     """
     cached = cache.get_search_volume(keyword)
     if cached != "MISS":
         return keyword, cached
     vol = _safe_call(lambda: ads_api.get_search_volume(keyword), tracker, "ads", log, f"volume:{keyword}")
-    time.sleep(0.3 + random.random() * 0.2)  # [v19.3] 0.08~0.16초 -> 0.3~0.5초
+    time.sleep(0.3 + random.random() * 0.2)  # 0.08~0.16초 -> 0.3~0.5초
     result = vol if isinstance(vol, int) else None  # None = API 호출 실패(429 등), 검색량 0과 구분
     cache.set_search_volume(keyword, result)
     return keyword, result
@@ -278,7 +296,7 @@ def _fetch_volume_one(ads_api, keyword, tracker, log, cache):
 
 def _select_volume_check_targets(candidates, limit=SEARCH_VOLUME_CHECK_LIMIT):
     """
-    [v19.3 신규] 1단계 검색량 확인 대상을 전체가 아니라 mentions -> intent_score
+    1단계 검색량 확인 대상을 전체가 아니라 mentions -> intent_score
     -> category_weight 순으로 우선순위를 매겨 상위 limit개 키워드만 선정한다.
     동일 키워드가 여러 카테고리에 걸쳐 있을 수 있으므로 키워드 단위로 유일화한 뒤
     가장 높은 우선순위 값을 대표값으로 사용해 정렬한다.
@@ -302,7 +320,7 @@ def _select_volume_check_targets(candidates, limit=SEARCH_VOLUME_CHECK_LIMIT):
 
 def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_workers=MAX_WORKERS):
     """
-    [v19.3] 1단계 검색량 확인.
+    1단계 검색량 확인.
 
     - 전체 후보가 아니라 mentions/intent_score/category_weight 기준 상위
       SEARCH_VOLUME_CHECK_LIMIT(250)건만 실제 ads API를 호출한다. 250건 밖
@@ -420,14 +438,14 @@ def _expand_related_one(ads_api, rep, tracker, log):
         lambda: ads_api.get_related_keywords(kw, limit=RELATED_LIMIT),
         tracker, "ads", log, f"related:{kw}"
     )
-    time.sleep(0.5 + random.random() * 0.3)  # [v19.3] 0.1~0.2초 -> 0.5~0.8초
+    time.sleep(0.5 + random.random() * 0.3)  # 0.1~0.2초 -> 0.5~0.8초
     failed = related is None  # 호출 자체가 실패한 경우(429 등)와 "연관검색어 없음"(빈 리스트)을 구분
     return rep, (related or []), failed
 
 
 def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=MAX_WORKERS):
     """
-    [v19.3] 대표 후보를 RELATED_CALL_BATCH_SIZE 단위로 나눠서 순차 확장하며,
+    대표 후보를 RELATED_CALL_BATCH_SIZE 단위로 나눠서 순차 확장하며,
     누적 실패율이 RELATED_CALL_ABORT_FAIL_RATE 이상이면(429 다발로 추정)
     남은 배치는 호출을 시도하지 않고 조기 중단한다.
     """
@@ -531,7 +549,7 @@ def _merge_pools(survived, expanded):
 
 
 # =========================================================================
-# 4. 3단계: 문서수 확인 (v19.1: 상위 150건 제한 / v19.2: 배치 처리 + 429 조기중단)
+# 4. 3단계: 문서수 확인 (상위 150건 제한 / 배치 처리 + 429 조기중단)
 # =========================================================================
 def _select_doc_check_targets(pool, limit=DOC_COUNT_CHECK_LIMIT):
     """검색량×의도점수 기준 상위 limit건만 실제 문서수 조회 대상으로 선정."""
@@ -559,7 +577,7 @@ def _check_doc_counts(targets, search_api, tracker, cache, log=None, max_workers
     문서수 API 실패는 candidates에서 제거(drop)하지 않고, doc_count=None,
     doc_api_failed=True로 표시만 한다. (등급 판정 단계에서 "보류"(검증보류)로 처리)
 
-    [v19.2] DOC_COUNT_BATCH_SIZE 단위로 나눠서 순차 처리하며, 배치가 끝날 때마다
+    DOC_COUNT_BATCH_SIZE 단위로 나눠서 순차 처리하며, 배치가 끝날 때마다
     누적 실패율을 점검한다. 시도 건수가 DOC_COUNT_ABORT_MIN_ATTEMPTS 이상이면서
     누적 실패율이 DOC_COUNT_ABORT_FAIL_RATE 이상이면(429 다발 상황으로 추정),
     남은 대상은 호출을 시도하지 않고 doc_call_aborted=True로 표시한 뒤
@@ -615,7 +633,7 @@ def _check_doc_counts(targets, search_api, tracker, cache, log=None, max_workers
                 c["doc_call_aborted"] = False
                 ok_count += 1
         else:
-            # [v19.2] 429 다발로 조기 중단되어 호출을 시도조차 하지 못한 경우
+            # 429 다발로 조기 중단되어 호출을 시도조차 하지 못한 경우
             c["doc_count"] = None
             c["verify_docs"] = False
             c["doc_api_failed"] = False
@@ -851,8 +869,18 @@ def _compute_datalab_score(datalab_ratio):
 
 
 def _compute_efficiency(search_volume, doc_count):
-    """[표시용 원시 효율값] search_volume/doc_count 그대로. UI 표시나 로그용으로 유지."""
-    doc_count = doc_count if doc_count is not None else 0
+    """
+    [표시용 원시 효율값] search_volume/doc_count 그대로. UI 표시나 로그용으로 유지.
+
+    [v19.4 수정] doc_count가 None(문서수 미확인)인 경우, 과거에는 0으로 치환해
+    나눈 결과 검색량 값이 그대로 효율로 노출되는 표시 버그가 있었다.
+    이제는 doc_count가 None이면 계산을 하지 않고 0.0을 반환하며, 호출부에서
+    별도의 efficiency_unknown 플래그로 "문서수 미확인 -> 효율도 미확인"임을
+    명시적으로 구분한다. FinalScore 계산에는 이 원시값이 쓰이지 않으므로
+    점수 로직에는 영향이 없다.
+    """
+    if doc_count is None:
+        return 0.0
     return round(search_volume / max(doc_count, 1), 2)
 
 
@@ -918,7 +946,7 @@ def _build_reason_tags(entry):
         tags.append("뉴스+검색 교차확인")
     if entry.get("mentions", 0) >= 5:
         tags.append("다수 매체 언급")
-    # [v19.3] 1단계 검색량 확인 관련 태그 (우선순위: 조기중단 > API실패 > 호출제한)
+    # 1단계 검색량 확인 관련 태그 (우선순위: 조기중단 > API실패 > 호출제한)
     if entry.get("volume_call_aborted"):
         tags.append("검색량 조회 중단(429)")
     elif entry.get("volume_api_failed"):
@@ -964,10 +992,10 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     if log:
         log(f"[scorer] 입력 후보 {len(candidates)}건, 5단계 검증 파이프라인 시작")
 
-    # ---- 1단계: 검색량 확인 (v19.3: 상위 250건 제한 + 429 대응) ----
+    # ---- 1단계: 검색량 확인 (상위 250건 제한 + 429 대응) ----
     survived_v, dropped_v, held_v = _check_search_volume(candidates, ads_api, tracker, cache, log, max_workers)
 
-    # ---- 2단계: 연관검색어 확장 (검색량 확인된 대표 후보에만, v19.3: 429 대응) ----
+    # ---- 2단계: 연관검색어 확장 (검색량 확인된 대표 후보에만, 429 대응) ----
     expanded = _expand_related_keywords(survived_v, ads_api, tracker, log, max_workers)
     pool = _merge_pools(survived_v, expanded)
 
@@ -988,7 +1016,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     doc_known = [c for c in all_after_doc if c["doc_count"] is not None]
     doc_unknown = [c for c in all_after_doc if c["doc_count"] is None]
 
-    # ---- [v19.3] 1단계에서 보류된 후보(held_v)는 2/3단계를 건너뛰고
+    # ---- 1단계에서 보류된 후보(held_v)는 2/3단계를 건너뛰고
     #      곧바로 문서수 미확인(doc_count=None) 그룹에 준하는 기본값을 채워
     #      아래 5단계 점수 계산 및 등급 분류(보류)로 합류시킨다. ----
     for c in held_v:
@@ -1045,6 +1073,11 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         entry["datalab_score"] = _compute_datalab_score(entry.get("datalab_ratio"))
         entry["efficiency"] = _compute_efficiency(entry["search_volume"], entry.get("doc_count"))
 
+        # [v19.4 신규] 문서수 미확인 시 효율도 확인 불가 상태임을 명시하는 플래그.
+        # app.py는 이 값과 doc_count is None 여부를 함께 확인해 효율 컬럼/문구를
+        # "-" 또는 "확인 불가"로 표시한다. FinalScore 계산에는 영향을 주지 않는다.
+        entry["efficiency_unknown"] = entry.get("doc_count") is None
+
         entry["_brand_penalty_applied"] = (
             _brand_institution_penalty_multiplier(entry.get("keyword", "")) < 1.0
             and entry.get("doc_count") is not None
@@ -1078,7 +1111,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         if entry["doc_count"] is None:
             entry["grade"] = "보류"
             entry["risk_reasons"] = []
-            # [v19.3] 1단계(검색량) 관련 보류 사유를 3단계(문서수) 사유보다 먼저 확인한다.
+            # 1단계(검색량) 관련 보류 사유를 3단계(문서수) 사유보다 먼저 확인한다.
             if entry.get("volume_call_aborted"):
                 entry["hold_reasons"] = [
                     "검색량 조회 제한으로 일부 미확인 (429 다발로 1단계 조회 중단) - 검증보류로 처리"
