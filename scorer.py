@@ -1,35 +1,37 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v19.1)
+scorer.py (v19.2)
 네이버 블로그 수익형 키워드 발굴 시스템 - 검증/확장/점수화/등급분류 통합 엔진
 
 [파이프라인 내 위치]
   collector.collect_candidates() -> profit_filter.filter_candidates() -> scorer.score_candidates()
 
-[v19.1 변경 사항 - 문서수 조회 상한 확대 (최소 수정)]
+[v19.2 변경 사항 - 문서수 조회 429 조기중단 로직 (최소 수정)]
 
-  문제: DOC_COUNT_CHECK_LIMIT=50으로 제한되어 있어, 상위 50건 외 후보는
-  문서수 API를 호출하지 않고 doc_count=None으로 남아 "보류" 등급 키워드의
-  문서수가 화면에 '-'로만 표시되는 문제가 있었다.
+  문제: v19.1에서 DOC_COUNT_CHECK_LIMIT을 50 -> 150으로 올린 결과, 문서수 API
+  호출 횟수가 3배로 늘어났다. 기존 _check_doc_counts()는 대상 전체를 한 번에
+  ThreadPoolExecutor에 던져놓고 끝까지 기다리는 방식이라, 429가 초반부터
+  다발해도 중간에 멈추지 못하고 150건 전부를(대부분 실패로) 끝까지 시도하게
+  되는 비효율이 있었다.
 
-  수정: DOC_COUNT_CHECK_LIMIT 값만 50 -> 150으로 상향. 이 상수는
-  _select_doc_check_targets()에서 그대로 참조되므로, 파이프라인 구조/
-  함수 시그니처/반환 필드는 전혀 변경되지 않는다. DOC_MAX_WORKERS(2)와
-  호출 간 sleep(0.15~0.30초)은 429 방지를 위해 기존과 동일하게 유지했다.
-  조회 대상이 3배 늘어나는 만큼 문서수 확인 단계의 총 소요 시간도 대략
-  3배 늘어날 수 있으니, 실행 후 429/timeout 발생 빈도를 로그로 확인 권장.
+  수정: _check_doc_counts()를 DOC_COUNT_BATCH_SIZE(20건) 단위 배치 순차 처리로
+  교체했다. 배치가 끝날 때마다 누적 시도 건수/실패 건수를 집계하고, 시도 건수가
+  DOC_COUNT_ABORT_MIN_ATTEMPTS(10) 이상이면서 누적 실패율이
+  DOC_COUNT_ABORT_FAIL_RATE(0.3) 이상이면(429 다발 상황으로 추정) 그 시점에서
+  나머지 배치는 호출을 시도하지 않고 조기 중단한다. 중단되어 호출 자체를
+  시도하지 못한 후보는 doc_call_aborted=True로 표시되며, doc_count는 기존과
+  동일하게 None으로 남아 화면에는 그대로 "-"로 표시된다. 로그에는
+  "문서수 조회 제한으로 일부 미확인" 문구를 포함한 안내를 남긴다.
 
-  doc_count가 실제로 조회된 보류 키워드는 기존과 동일하게 doc_count에
-  정상 숫자가 채워지고, doc_count=None인 경우(API 실패 또는 상위 150건
-  밖으로 여전히 미조회)만 그대로 None으로 유지되어 app.py에서 '-'로
-  표시된다.
+  이 외의 로직(효율 계산, 브랜드/기관명 페널티 강도, 문서수 절대값 임계값,
+  news/ads 소스 우선순위 등)은 v19.1과 완전히 동일하며 이번 단계에서는
+  변경하지 않았다.
 
 [이하 v19의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
 
   이전 버전(v18.8)의 한계: OpportunityScore가 log(검색량)/log(문서수) 비율
-  기반이라, 검색량 자체가 매우 큰 키워드(예: 검색량 130,000 / 문서수
-  1,700,000)는 비율상 여전히 높은 점수를 받아 "자동차보험", "건강보험공단"
-  같은 범용/기관 키워드가 TOP5에 올라오는 문제가 있었다.
+  기반이라, 검색량 자체가 매우 큰 키워드는 비율상 여전히 높은 점수를 받아
+  범용/기관 키워드가 TOP5에 올라오는 문제가 있었다.
 
   1) EfficiencyScore 신설: 검색량/문서수 비율을 log10(효율+1) 기반으로
      0~10 스케일로 환산한 독립 점수.
@@ -43,7 +45,10 @@ scorer.py (v19.1)
   5) FinalScore = Opportunity*0.45 + Efficiency*0.25 + Category*0.15
                   + Issue*0.10 + DataLab*0.05
 
-[출력 계약] score_candidates()는 (results, api_health) 튜플을 반환한다. (v19와 동일 필드 유지)
+[v19.1] DOC_COUNT_CHECK_LIMIT: 50 -> 150 (보류 키워드도 문서수를 확인할 수 있도록)
+
+[출력 계약] score_candidates()는 (results, api_health) 튜플을 반환한다. (v19.x와 동일 필드 유지)
+  - 신규 추가 필드(비파괴적 추가): doc_call_aborted (bool)
 
 표준 라이브러리만 사용 (math, time, random, threading, datetime, concurrent.futures)
 -> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
@@ -74,11 +79,15 @@ TOP5_SIZE = 5
 TOP10_SIZE = 10                 # TOP5 이후 순위 6~15
 MAX_WORKERS = 4                 # 1단계(검색량)/2단계(연관검색어) 병렬 수
 
-# [v19.1] 50 -> 150 으로 상향 (보류 키워드도 문서수를 확인할 수 있도록)
-DOC_COUNT_CHECK_LIMIT = 150      # 문서수 조회는 검색량×의도점수 상위 150건까지만 실제 호출
+DOC_COUNT_CHECK_LIMIT = 150      # 문서수 조회는 검색량×의도점수 상위 150건까지만 실제 호출 (v19.1)
 DATALAB_CHECK_LIMIT = 25         # DataLab 조회는 문서수 확인된 후보 중 효율 상위 25건까지만 실제 호출
-DOC_MAX_WORKERS = 2              # 문서수 조회 병렬 수 (429 방지, 변경 없음)
-DATALAB_MAX_WORKERS = 1          # DataLab 조회는 순차 처리 (timeout 방지, 변경 없음)
+DOC_MAX_WORKERS = 2              # 문서수 조회 병렬 수 (429 방지)
+DATALAB_MAX_WORKERS = 1          # DataLab 조회는 순차 처리 (timeout 방지)
+
+# [v19.2 신규] 문서수 조회 429 조기중단 로직 파라미터
+DOC_COUNT_BATCH_SIZE = 20           # 이 단위로 나눠서 조회하며 배치마다 실패율을 점검한다
+DOC_COUNT_ABORT_MIN_ATTEMPTS = 10   # 최소 이만큼 시도한 뒤부터 중단 여부를 판단한다
+DOC_COUNT_ABORT_FAIL_RATE = 0.3     # 누적 실패율이 이 값 이상이면 조회를 중단한다
 
 # 범용/상시성 앵커 - "위험" 등급 및 OpportunityScore 감점에 함께 사용
 GENERIC_RISK_ANCHORS = {"보험", "대출", "연금", "세금", "카드", "부동산", "청약"}
@@ -358,7 +367,7 @@ def _merge_pools(survived, expanded):
 
 
 # =========================================================================
-# 4. 3단계: 문서수 확인 (v19.1: 상위 150건 제한)
+# 4. 3단계: 문서수 확인 (v19.1: 상위 150건 제한 / v19.2: 배치 처리 + 429 조기중단)
 # =========================================================================
 def _select_doc_check_targets(pool, limit=DOC_COUNT_CHECK_LIMIT):
     """검색량×의도점수 기준 상위 limit건만 실제 문서수 조회 대상으로 선정."""
@@ -385,37 +394,81 @@ def _check_doc_counts(targets, search_api, tracker, cache, log=None, max_workers
     대상은 이미 상위 N건으로 제한된 상태로 들어온다.
     문서수 API 실패는 candidates에서 제거(drop)하지 않고, doc_count=None,
     doc_api_failed=True로 표시만 한다. (등급 판정 단계에서 "보류"(검증보류)로 처리)
+
+    [v19.2] DOC_COUNT_BATCH_SIZE 단위로 나눠서 순차 처리하며, 배치가 끝날 때마다
+    누적 실패율을 점검한다. 시도 건수가 DOC_COUNT_ABORT_MIN_ATTEMPTS 이상이면서
+    누적 실패율이 DOC_COUNT_ABORT_FAIL_RATE 이상이면(429 다발 상황으로 추정),
+    남은 대상은 호출을 시도하지 않고 doc_call_aborted=True로 표시한 뒤
+    doc_count=None("-" 표시)으로 남긴다.
     """
     unique_keywords = list({c["keyword"] for c in targets})
+
     doc_map = {}
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        futures = {
-            executor.submit(_fetch_doc_count_one, search_api, kw, tracker, log, cache): kw
-            for kw in unique_keywords
-        }
-        for future in as_completed(futures):
-            kw, count = future.result()
-            doc_map[kw] = count
+    attempted = 0
+    fail_total = 0
+    aborted = False
+    processed_keywords = set()
+
+    for batch_start in range(0, len(unique_keywords), DOC_COUNT_BATCH_SIZE):
+        if aborted:
+            break
+        batch = unique_keywords[batch_start:batch_start + DOC_COUNT_BATCH_SIZE]
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            futures = {
+                executor.submit(_fetch_doc_count_one, search_api, kw, tracker, log, cache): kw
+                for kw in batch
+            }
+            for future in as_completed(futures):
+                kw, count = future.result()
+                doc_map[kw] = count
+                processed_keywords.add(kw)
+                attempted += 1
+                if count is None:
+                    fail_total += 1
+
+        if attempted >= DOC_COUNT_ABORT_MIN_ATTEMPTS and (fail_total / attempted) >= DOC_COUNT_ABORT_FAIL_RATE:
+            aborted = True
 
     ok_count = 0
     fail_count = 0
+    aborted_count = 0
     for c in targets:
-        count = doc_map.get(c["keyword"])
-        if count is None:
+        kw = c["keyword"]
+        if kw in processed_keywords:
+            count = doc_map.get(kw)
+            if count is None:
+                c["doc_count"] = None
+                c["verify_docs"] = False
+                c["doc_api_failed"] = True
+                c["doc_check_skipped"] = False
+                c["doc_call_aborted"] = False
+                fail_count += 1
+            else:
+                c["doc_count"] = count
+                c["verify_docs"] = True
+                c["doc_api_failed"] = False
+                c["doc_check_skipped"] = False
+                c["doc_call_aborted"] = False
+                ok_count += 1
+        else:
+            # [v19.2] 429 다발로 조기 중단되어 호출을 시도조차 하지 못한 경우
             c["doc_count"] = None
             c["verify_docs"] = False
-            c["doc_api_failed"] = True
-            c["doc_check_skipped"] = False
-            fail_count += 1
-        else:
-            c["doc_count"] = count
-            c["verify_docs"] = True
             c["doc_api_failed"] = False
             c["doc_check_skipped"] = False
-            ok_count += 1
+            c["doc_call_aborted"] = True
+            aborted_count += 1
 
     if log:
-        log(f"[scorer] 3단계 문서수 확인 대상 {len(targets)}건 - 통과 {ok_count}건 / API 실패(검증보류) {fail_count}건")
+        summary = (f"[scorer] 3단계 문서수 확인 대상 {len(targets)}건 - 통과 {ok_count}건 / "
+                   f"API 실패(검증보류) {fail_count}건")
+        if aborted_count:
+            summary += f" / 조회 중단(429 다발) {aborted_count}건"
+        log(summary)
+        if aborted:
+            log(f"[scorer] 문서수 조회 제한으로 일부 미확인 - 실패율 {fail_total}/{attempted} "
+                f"({(fail_total / attempted * 100):.0f}%)로 임계값({DOC_COUNT_ABORT_FAIL_RATE * 100:.0f}%) 초과, "
+                f"남은 {aborted_count}건은 조회를 중단하고 '-'로 표시합니다.")
 
     return targets
 
@@ -705,6 +758,8 @@ def _build_reason_tags(entry):
         tags.append("문서수 미확인(제한)")
     if entry.get("doc_api_failed"):
         tags.append("문서수 확인 실패")
+    if entry.get("doc_call_aborted"):
+        tags.append("문서수 조회 중단(429)")
     if entry.get("search_volume", 0) < LOW_VOLUME_PENALTY_CUT:
         tags.append("저검색량 감점")
     if entry.get("_brand_penalty_applied"):
@@ -745,7 +800,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     expanded = _expand_related_keywords(survived_v, ads_api, tracker, log, max_workers)
     pool = _merge_pools(survived_v, expanded)
 
-    # ---- 3단계: 문서수 확인 (v19.1: 상위 150건만 실제 호출) ----
+    # ---- 3단계: 문서수 확인 (상위 150건만 실제 호출, 배치 처리 + 429 조기중단) ----
     doc_targets, doc_skip = _select_doc_check_targets(pool, DOC_COUNT_CHECK_LIMIT)
     _check_doc_counts(doc_targets, search_api, tracker, cache, log, DOC_MAX_WORKERS)
     for c in doc_skip:
@@ -753,6 +808,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         c["verify_docs"] = False
         c["doc_api_failed"] = False
         c["doc_check_skipped"] = True
+        c["doc_call_aborted"] = False   # [v19.2 추가]
     if log and doc_skip:
         log(f"[scorer] 3단계 호출 제한: 상위 {DOC_COUNT_CHECK_LIMIT}건 외 {len(doc_skip)}건은 "
             f"문서수 미확인(검증보류) 처리")
@@ -839,6 +895,11 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
             entry["risk_reasons"] = []
             if entry.get("doc_api_failed"):
                 entry["hold_reasons"] = ["문서수 확인 실패(API 오류) - 검증보류로 처리"]
+            elif entry.get("doc_call_aborted"):
+                # [v19.2 추가] 429 다발로 조회 자체를 시도하지 못한 경우
+                entry["hold_reasons"] = [
+                    "문서수 조회 제한으로 일부 미확인 (429 다발로 조회 중단) - 검증보류로 처리"
+                ]
             else:
                 entry["hold_reasons"] = [
                     f"호출 제한(상위 {DOC_COUNT_CHECK_LIMIT}건 외)으로 문서수 미확인 - 검증보류로 처리"
@@ -921,7 +982,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         log(f"[scorer] API 상태: 검색={api_health['search']}, "
             f"검색광고={api_health['ads']}, DataLab={api_health['datalab']}")
         log(f"[scorer] 탈락/제한 현황: 검색량 미달 {len(dropped_v)}건, "
-            f"문서수 미확인(API실패+호출제한) {len(doc_unknown)}건, "
+            f"문서수 미확인(API실패+호출제한+조회중단) {len(doc_unknown)}건, "
             f"DataLab 미조회(중립값 적용) {len(datalab_skip) + len(doc_unknown)}건")
 
     return finalized, api_health
