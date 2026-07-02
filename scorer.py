@@ -1,102 +1,76 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v19.4)
+scorer.py (v19.5)
 네이버 블로그 수익형 키워드 발굴 시스템 - 검증/확장/점수화/등급분류 통합 엔진
 
 [파이프라인 내 위치]
   collector.collect_candidates() -> profit_filter.filter_candidates() -> scorer.score_candidates()
 
-[v19.4 변경 사항 - 효율(efficiency) 표시 버그 수정 (최소 수정)]
+[v19.5 변경 사항 - ads API HTTP 400(Bad Request) 대응 (최소 수정)]
 
-  문제: 문서수(doc_count)를 확인하지 못한 보류 키워드의 경우, 기존
-  _compute_efficiency()가 doc_count=None을 0으로 치환한 뒤 나눗셈을 수행해
-  결과적으로 "검색량 / 1" 즉 검색량 값 그대로가 효율로 계산되는 버그가
-  있었다. 예를 들어 검색량 4,460 / 문서수 미확인 키워드의 효율이 4460.00으로
-  표시되는 등, 문서수를 확인하지 못했는데도 마치 매우 효율이 좋은 키워드처럼
-  잘못 보이는 문제가 있었다.
-
-  수정 내용:
-    1) _compute_efficiency(): doc_count가 None이면 계산을 하지 않고 0.0을
-       반환한다. (더 이상 doc_count를 0으로 치환해 나누지 않음)
-    2) 5단계 점수 계산 루프에 entry["efficiency_unknown"] = (doc_count is None)
-       필드를 추가한다. 이 값은 app.py가 화면에 효율을 "-" 또는 "확인 불가"로
-       표시할지를 판단하는 근거로 사용된다.
-
-  FinalScore 계산에는 efficiency(원시값)가 직접 쓰이지 않고 별도의
-  efficiency_score와 중립값(EFFICIENCY_NEUTRAL_FOR_UNKNOWN_DOC=3.0)이 쓰이므로,
-  이번 수정은 점수 계산/등급 분류/API 호출 로직에는 전혀 영향을 주지 않는다.
-  이 외의 로직은 v19.3과 완전히 동일하다.
-
-[이하 v19.3의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
-
-  원인: 로그 분석 결과 429 에러는 3단계(문서수, search API)가 아니라
-  1단계(검색량 확인)와 2단계(연관검색어 확장) - 즉 ads API 호출 단계에서
-  대량 발생하고 있었다. 기존 로직은 (a) 전체 후보를 병렬 4개로 한꺼번에
-  ads API에 던지고, (b) 호출이 실패하면 검색량을 0으로 간주해 그대로
-  탈락시키는 구조라, 429가 터지면 정상 키워드까지 통째로 사라지는 문제가
-  있었다.
+  문제: 로그에 "HTTP 400 - hintKeywords 파라미터가 유효하지 않습니다"가 다수
+  발생하고 있었다. 이는 429(과다 호출)와는 원인이 다른 문제로, ads API에
+  전달하는 키워드 자체의 형식(너무 긴 키워드, 특수문자 포함, 공백/기호 포함,
+  빈 문자열 등)이 hintKeywords 파라미터 규격에 맞지 않아 발생하는 것으로
+  판단된다. 속도를 늦추는 429 대응만으로는 이 문제를 해결할 수 없다.
 
   수정 내용:
-    1) MAX_WORKERS 4 -> 2 (필요 시 1로 더 낮출 수 있도록 주석에 남김)
-    2) _fetch_volume_one() sleep 0.08~0.16초 -> 0.3~0.5초
-    3) _expand_related_one() sleep 0.1~0.2초 -> 0.5~0.8초
-    4) 1단계 검색량 확인 대상을 전체가 아니라 mentions/intent_score/
-       category_weight 기준 상위 250건(SEARCH_VOLUME_CHECK_LIMIT)으로 제한.
-       250건 밖 후보는 호출 자체를 하지 않고 volume_check_skipped=True로
-       표시해 "보류"로 넘긴다.
-    5) 2단계 연관검색어 확장 대표 후보 수를 카테고리별 5개 -> 3개
-       (MAX_RELATED_PER_CATEGORY)로 축소.
-    6) 1단계/2단계 모두 문서수 조회(3단계)와 동일한 방식의 배치 조기중단
-       로직 추가. 1단계는 VOLUME_CALL_BATCH_SIZE(20) 단위, 2단계는
-       RELATED_CALL_BATCH_SIZE(10) 단위로 순차 호출하며, 누적 실패율이
-       각각 VOLUME_CALL_ABORT_FAIL_RATE / RELATED_CALL_ABORT_FAIL_RATE
-       (0.3) 이상이면 남은 배치는 호출을 시도하지 않고 중단한다.
-    7) ads API 호출 실패(429 등)는 검색량 0 탈락이 아니라
-       volume_api_failed=True로 표시하고 grade='보류'로 최종 결과에
-       포함시킨다. 호출 제한으로 애초에 시도하지 못한 경우는
-       volume_check_skipped=True, 조기중단으로 시도하지 못한 경우는
-       volume_call_aborted=True로 구분한다. 실제로 호출에 성공했는데
-       진짜 검색량이 MIN_SEARCH_VOLUME(10) 미만인 경우만 기존처럼
-       탈락(dropped) 처리한다.
-    8) 로그에 1단계/2단계 각각 확인 대상, 성공/실패, 조기중단 여부와
-       실패율을 상세히 출력한다.
-    9) score_candidates()의 반환 형태((results, api_health) 튜플)와
-       기존 필드는 모두 유지한다.
+    1) _sanitize_keyword_for_ads() 신설: ads API(get_search_volume,
+       get_related_keywords)에 키워드를 넘기기 전에 다음을 검사한다.
+         - 앞뒤 공백 제거, 연속 공백은 하나로 정리
+         - 한글/영문/숫자/공백만 허용(특수문자가 하나라도 있으면 무효)
+         - 정리 후 길이가 MIN_KEYWORD_LENGTH_FOR_ADS ~
+           MAX_KEYWORD_LENGTH_FOR_ADS 범위를 벗어나면 무효
+    2) 1단계(_check_search_volume)와 2단계(_expand_related_keywords) 모두
+       실제 API 호출 배치를 시작하기 전에 유효/무효 키워드를 먼저 나눈다.
+       무효 키워드는 API를 호출하지 않고 곧바로 volume_invalid_keyword=True로
+       표시해 "보류"로 넘긴다. 429 조기중단 로직의 실패율 계산에는 무효
+       키워드가 섞이지 않도록, 배치 루프 자체에 무효 키워드를 포함시키지
+       않는다(호출 속도 문제와 파라미터 형식 문제를 서로 오염시키지 않음).
+    3) ApiHealthTracker에 record_error_type()/error_summary()를 추가해
+       ads API 실패 시 예외 메시지에 "400"이 포함되면 http_400, "429"가
+       포함되면 http_429, 그 외는 other로 구분해 집계한다. 분석 종료 시
+       로그에 이 3가지 수치를 출력해 400과 429를 구분할 수 있게 한다.
+    4) score_candidates()의 반환 형태((results, api_health) 튜플)와
+       api_health 딕셔너리 구조는 변경하지 않았다. 신규 필드
+       volume_invalid_keyword(bool)는 비파괴적 추가이므로 app.py 수정
+       없이 그대로 동작한다.
+    5) 문서수(3단계, search API)와 DataLab(4단계) 호출은 이번 문제(ads API
+       hintKeywords 400)와 무관하므로 변경하지 않았다.
 
-  3단계(문서수) 조기중단 로직(v19.2), 점수 가중치/페널티 구조(v19) 등
-  이 외의 로직은 이번 단계에서 변경하지 않았다.
+[이하 v19.4/v19.3의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
 
-  이전 버전(v18.8)의 한계: OpportunityScore가 log(검색량)/log(문서수) 비율
-  기반이라, 검색량 자체가 매우 큰 키워드는 비율상 여전히 높은 점수를 받아
-  범용/기관 키워드가 TOP5에 올라오는 문제가 있었다.
+  v19.4: 문서수를 확인하지 못한 보류 키워드의 효율(efficiency) 표시 버그
+  수정. _compute_efficiency()가 doc_count=None을 0으로 치환해 나누던 것을
+  0.0을 그대로 반환하도록 고치고, entry["efficiency_unknown"] 플래그를
+  추가해 app.py가 화면에 "-"/"확인 불가"로 표시할 수 있게 했다.
 
-  1) EfficiencyScore 신설: 검색량/문서수 비율을 log10(효율+1) 기반으로
-     0~10 스케일로 환산한 독립 점수.
-  2) 문서수 절대값 페널티 강화 (5단계): 100만↑ x0.05, 50만↑ x0.15,
-     30만↑ x0.3, 10만↑ x0.6, 5만↑ x0.8
-  3) 검색량 게이트 3단: 500 미만 50%감점 / 300 미만 TOP5 제외 /
-     100 미만 TOP10도 제외(무조건 보류)
-  4) 브랜드/기관명 페널티(x0.5): 공단/심사평가원/정부24/네이버/카카오/
-     삼성/현대 등. 문서수 페널티/범용어 앵커 페널티와는 곱하지 않고
-     셋 중 가장 강한 배수 하나만 적용.
-  5) FinalScore = Opportunity*0.45 + Efficiency*0.25 + Category*0.15
-                  + Issue*0.10 + DataLab*0.05
+  v19.3: 1단계(검색량)/2단계(연관검색어) ads API 429 대응. MAX_WORKERS
+  4->2, sleep 증가, 1단계 대상 상위 250건 제한, 2단계 대표 후보 5->3개
+  축소, 배치 조기중단 로직, ads API 실패 시 검색량 0 탈락이 아니라
+  volume_api_failed=True로 보류 처리.
 
-[v19.1] DOC_COUNT_CHECK_LIMIT: 50 -> 150 (보류 키워드도 문서수를 확인할 수 있도록)
-
-[v19.2] 문서수 조회(3단계)를 배치(20건) 단위로 처리하며, 누적 실패율이
+  v19.2: 문서수 조회(3단계)를 배치(20건) 단위로 처리하며, 누적 실패율이
   30% 이상이면 조기 중단한다. 중단된 항목은 doc_call_aborted=True.
+
+  v19.1: DOC_COUNT_CHECK_LIMIT 50 -> 150.
+
+  v19: EfficiencyScore 신설, 문서수 절대값 페널티 5단계 강화, 검색량 게이트
+  3단, 브랜드/기관명 페널티(x0.5), FinalScore 가중치 재분배(Opportunity
+  0.45/Efficiency 0.25/Category 0.15/Issue 0.10/DataLab 0.05).
 
 [출력 계약] score_candidates()는 (results, api_health) 튜플을 반환한다. (v19.x와 동일 필드 유지)
   - 신규 추가 필드(비파괴적 추가, v19.2): doc_call_aborted (bool)
   - 신규 추가 필드(비파괴적 추가, v19.3): volume_api_failed (bool),
     volume_check_skipped (bool), volume_call_aborted (bool)
   - 신규 추가 필드(비파괴적 추가, v19.4): efficiency_unknown (bool)
+  - 신규 추가 필드(비파괴적 추가, v19.5): volume_invalid_keyword (bool)
 
-표준 라이브러리만 사용 (math, time, random, threading, datetime, concurrent.futures)
+표준 라이브러리만 사용 (math, time, random, re, threading, datetime, concurrent.futures)
 -> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
 """
 
+import re
 import math
 import time
 import random
@@ -132,6 +106,10 @@ VOLUME_CALL_ABORT_FAIL_RATE = 0.3   # 누적 실패율이 이 값 이상이면 1
 RELATED_CALL_BATCH_SIZE = 10        # 대표 후보 수가 적으므로 문서수/검색량보다 작은 배치 단위 사용
 RELATED_CALL_ABORT_MIN_ATTEMPTS = 5
 RELATED_CALL_ABORT_FAIL_RATE = 0.3
+
+# [v19.5 신규] ads API(hintKeywords) 400 방지를 위한 키워드 유효성 검사 파라미터
+MIN_KEYWORD_LENGTH_FOR_ADS = 2      # 정리 후 길이가 이보다 짧으면 호출하지 않음(운영 중 튜닝 가능)
+MAX_KEYWORD_LENGTH_FOR_ADS = 40     # 정리 후 길이가 이보다 길면 호출하지 않음(운영 중 튜닝 가능)
 
 DOC_COUNT_CHECK_LIMIT = 150      # 문서수 조회는 검색량×의도점수 상위 150건까지만 실제 호출 (v19.1)
 DATALAB_CHECK_LIMIT = 25         # DataLab 조회는 문서수 확인된 후보 중 효율 상위 25건까지만 실제 호출
@@ -204,11 +182,29 @@ class ApiHealthTracker:
             "ads": {"ok": 0, "fail": 0},
             "datalab": {"ok": 0, "fail": 0},
         }
+        # [v19.5 신규] ads API 실패를 400(파라미터 오류)/429(과다호출)/기타로 구분해 집계
+        self._error_counts = {"http_400": 0, "http_429": 0, "other": 0}
 
     def record(self, api_name, success):
         with self._lock:
             key = "ok" if success else "fail"
             self._counts[api_name][key] += 1
+
+    def record_error_type(self, error_message):
+        """
+        [v19.5 신규] API 호출 실패 시 예외 메시지 문자열에서 HTTP 상태코드를
+        추정해 집계한다. naver_search_api.py의 예외 메시지가 "HTTP 400 - ...",
+        "HTTP 429 - ..." 형태라는 것을 로그에서 확인했으므로, 메시지 안에
+        "400"/"429" 문자열이 포함되어 있는지로 단순 분류한다.
+        """
+        with self._lock:
+            msg = error_message or ""
+            if "400" in msg:
+                self._error_counts["http_400"] += 1
+            elif "429" in msg:
+                self._error_counts["http_429"] += 1
+            else:
+                self._error_counts["other"] += 1
 
     def summarize(self):
         summary = {}
@@ -224,6 +220,11 @@ class ApiHealthTracker:
                 summary[api_name] = "partial"
         return summary
 
+    def error_summary(self):
+        """[v19.5 신규] 실패 유형별 집계(400/429/기타)를 반환한다. 로그 출력용."""
+        with self._lock:
+            return dict(self._error_counts)
+
 
 def _safe_call(fn, tracker, api_name, log=None, context=""):
     """API 호출을 감싸서 예외를 흡수하고 성공/실패를 tracker에 기록. 실패 시 None 반환."""
@@ -233,6 +234,7 @@ def _safe_call(fn, tracker, api_name, log=None, context=""):
         return result
     except Exception as e:
         tracker.record(api_name, False)
+        tracker.record_error_type(str(e))  # [v19.5 신규] 400/429/기타 구분 집계
         if log:
             log(f"[scorer] API 호출 실패 ({api_name}, {context}): {e}")
         return None
@@ -276,18 +278,57 @@ class _KeywordCache:
 
 
 # =========================================================================
+# 1B. [v19.5 신규] ads API(hintKeywords) 400 방지를 위한 키워드 유효성 검사
+# =========================================================================
+_KEYWORD_ALLOWED_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9 ]+$")
+
+
+def _sanitize_keyword_for_ads(raw_keyword):
+    """
+    ads API(hintKeywords)에 전달하기 전 키워드를 정리하고 유효성을 검사한다.
+
+    - 앞뒤 공백 제거, 연속 공백은 하나로 정리
+    - 한글/영문/숫자/공백만 허용(그 외 특수문자가 하나라도 포함되면 무효)
+    - 정리 후 길이가 MIN_KEYWORD_LENGTH_FOR_ADS ~ MAX_KEYWORD_LENGTH_FOR_ADS
+      범위를 벗어나면 무효
+    - 빈 문자열은 당연히 무효
+
+    이 함수를 통과하지 못한 키워드는 ads API(get_search_volume,
+    get_related_keywords) 호출 자체를 시도하지 않는다. 호출 실패(429 등)와는
+    원인이 다르므로 volume_invalid_keyword로 별도 표시한다.
+
+    Returns
+    -------
+    (cleaned_keyword, is_valid) : tuple[str, bool]
+    """
+    if not raw_keyword:
+        return "", False
+    cleaned = re.sub(r"\s+", " ", raw_keyword.strip())
+    if not cleaned:
+        return cleaned, False
+    if not _KEYWORD_ALLOWED_PATTERN.match(cleaned):
+        return cleaned, False
+    if not (MIN_KEYWORD_LENGTH_FOR_ADS <= len(cleaned) <= MAX_KEYWORD_LENGTH_FOR_ADS):
+        return cleaned, False
+    return cleaned, True
+
+
+# =========================================================================
 # 2. 1단계: 검색량 확인
 # =========================================================================
 def _fetch_volume_one(ads_api, keyword, tracker, log, cache):
     """
+    이 함수는 이미 _sanitize_keyword_for_ads()를 통과한 keyword에 대해서만
+    호출된다(호출부인 _check_search_volume에서 사전 필터링). 실제 API에는
+    정리된(cleaned) 키워드를 전달한다.
+
     반환값의 두 번째 요소는 int(검색량) 또는 None(API 호출 실패)이다.
-    실패 시 0으로 치환하지 않고 None으로 명확히 구분해서 상위에서
-    "보류" 처리할 수 있게 한다.
     """
     cached = cache.get_search_volume(keyword)
     if cached != "MISS":
         return keyword, cached
-    vol = _safe_call(lambda: ads_api.get_search_volume(keyword), tracker, "ads", log, f"volume:{keyword}")
+    cleaned, _ = _sanitize_keyword_for_ads(keyword)  # 이미 유효성 검사를 통과했으므로 cleaned만 사용
+    vol = _safe_call(lambda: ads_api.get_search_volume(cleaned), tracker, "ads", log, f"volume:{keyword}")
     time.sleep(0.3 + random.random() * 0.2)  # 0.08~0.16초 -> 0.3~0.5초
     result = vol if isinstance(vol, int) else None  # None = API 호출 실패(429 등), 검색량 0과 구분
     cache.set_search_volume(keyword, result)
@@ -325,9 +366,15 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
     - 전체 후보가 아니라 mentions/intent_score/category_weight 기준 상위
       SEARCH_VOLUME_CHECK_LIMIT(250)건만 실제 ads API를 호출한다. 250건 밖
       후보는 volume_check_skipped=True로 표시해 "보류"로 넘긴다.
-    - VOLUME_CALL_BATCH_SIZE 단위로 나눠서 순차 호출하며, 누적 실패율이
-      VOLUME_CALL_ABORT_FAIL_RATE 이상이면(429 다발로 추정) 남은 배치는
-      호출을 시도하지 않고 조기 중단한다. 중단된 키워드는
+    - [v19.5] 선정된 250건 중에서도 _sanitize_keyword_for_ads() 검사를
+      통과하지 못한 키워드(특수문자/길이 등 hintKeywords 형식 오류 가능성이
+      높은 키워드)는 애초에 API 호출 배치에 포함시키지 않고
+      volume_invalid_keyword=True로 표시해 "보류"로 넘긴다. 이 키워드들은
+      429 조기중단 실패율 계산에도 포함되지 않는다(호출 속도 문제와
+      파라미터 형식 문제를 서로 오염시키지 않기 위함).
+    - 나머지 유효 키워드는 VOLUME_CALL_BATCH_SIZE 단위로 나눠서 순차 호출하며,
+      누적 실패율이 VOLUME_CALL_ABORT_FAIL_RATE 이상이면(429 다발로 추정)
+      남은 배치는 호출을 시도하지 않고 조기 중단한다. 중단된 키워드는
       volume_call_aborted=True로 표시한다.
     - ads API 호출이 실패(429 등)한 키워드는 검색량 0으로 간주해 탈락시키지
       않고 volume_api_failed=True로 표시해 "보류"로 넘긴다.
@@ -339,9 +386,19 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
     (survived, dropped, held) : tuple[list[dict], list[dict], list[dict]]
       - survived: 검색량 확인 성공 + MIN_SEARCH_VOLUME 이상
       - dropped : 검색량 확인 성공 + MIN_SEARCH_VOLUME 미만(진짜 저검색량, 탈락)
-      - held    : 호출 제한/API 실패/조기중단으로 검색량을 확인하지 못함(보류)
+      - held    : 호출 제한/무효 키워드/API 실패/조기중단으로 검색량을 확인하지 못함(보류)
     """
     selected_keywords, skipped_keywords = _select_volume_check_targets(candidates)
+
+    # [v19.5] 실제 호출 전에 유효/무효 키워드를 먼저 나눈다.
+    valid_keywords = []
+    invalid_keywords = set()
+    for kw in selected_keywords:
+        _, is_valid = _sanitize_keyword_for_ads(kw)
+        if is_valid:
+            valid_keywords.append(kw)
+        else:
+            invalid_keywords.add(kw)
 
     volume_map = {}
     attempted = 0
@@ -349,11 +406,10 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
     aborted = False
     processed_keywords = set()
 
-    keyword_list = list(selected_keywords)
-    for batch_start in range(0, len(keyword_list), VOLUME_CALL_BATCH_SIZE):
+    for batch_start in range(0, len(valid_keywords), VOLUME_CALL_BATCH_SIZE):
         if aborted:
             break
-        batch = keyword_list[batch_start:batch_start + VOLUME_CALL_BATCH_SIZE]
+        batch = valid_keywords[batch_start:batch_start + VOLUME_CALL_BATCH_SIZE]
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {
                 executor.submit(_fetch_volume_one, ads_api, kw, tracker, log, cache): kw
@@ -370,7 +426,7 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
         if attempted >= VOLUME_CALL_ABORT_MIN_ATTEMPTS and (fail_total / attempted) >= VOLUME_CALL_ABORT_FAIL_RATE:
             aborted = True
 
-    aborted_keywords = set(keyword_list) - processed_keywords
+    aborted_keywords = set(valid_keywords) - processed_keywords
 
     survived, dropped, held = [], [], []
     for c in candidates:
@@ -378,7 +434,14 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
         entry = dict(c)
         entry["volume_check_skipped"] = kw in skipped_keywords
         entry["volume_call_aborted"] = kw in aborted_keywords
+        entry["volume_invalid_keyword"] = kw in invalid_keywords
         entry["volume_api_failed"] = False
+
+        if kw in invalid_keywords:
+            entry["search_volume"] = 0
+            entry["verify_volume"] = False
+            held.append(entry)
+            continue
 
         if kw in skipped_keywords or kw in aborted_keywords:
             entry["search_volume"] = 0
@@ -405,8 +468,13 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
         log(f"[scorer] 1단계 검색량 확인 대상 {len(selected_keywords)}건 "
             f"(mentions/intent_score/category_weight 상위 {SEARCH_VOLUME_CHECK_LIMIT}건, "
             f"전체 {len(candidates)}건 중 {len(skipped_keywords)}건은 호출 제한으로 미확인)")
+        if invalid_keywords:
+            log(f"[scorer] 1단계 ads API 호출 제외(무효 키워드) {len(invalid_keywords)}건 "
+                f"- 특수문자/길이 제한 등으로 hintKeywords 형식에 부적합해 호출 자체를 시도하지 않음 "
+                f"(HTTP 400 방지)")
         log(f"[scorer] 1단계 검색량 확인 결과 - 통과 {len(survived)}건 / "
-            f"저검색량 탈락 {len(dropped)}건 / API실패·호출제한·조기중단으로 보류 {len(held)}건")
+            f"저검색량 탈락 {len(dropped)}건 / "
+            f"API실패·호출제한·조기중단·무효키워드로 보류 {len(held)}건")
         if aborted:
             log(f"[scorer] 1단계 검색량 API 429 다발로 조기중단 - 실패율 {fail_total}/{attempted} "
                 f"({(fail_total / attempted * 100):.0f}%)로 임계값({VOLUME_CALL_ABORT_FAIL_RATE * 100:.0f}%) 초과, "
@@ -433,9 +501,15 @@ def _select_representatives(survived, per_category=MAX_RELATED_PER_CATEGORY):
 
 
 def _expand_related_one(ads_api, rep, tracker, log):
+    """
+    이 함수는 이미 _sanitize_keyword_for_ads()를 통과한 rep에 대해서만
+    호출된다(호출부인 _expand_related_keywords에서 사전 필터링). 실제 API에는
+    정리된(cleaned) 키워드를 전달한다.
+    """
     kw = rep["keyword"]
+    cleaned, _ = _sanitize_keyword_for_ads(kw)  # 이미 유효성 검사를 통과했으므로 cleaned만 사용
     related = _safe_call(
-        lambda: ads_api.get_related_keywords(kw, limit=RELATED_LIMIT),
+        lambda: ads_api.get_related_keywords(cleaned, limit=RELATED_LIMIT),
         tracker, "ads", log, f"related:{kw}"
     )
     time.sleep(0.5 + random.random() * 0.3)  # 0.1~0.2초 -> 0.5~0.8초
@@ -448,6 +522,10 @@ def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=M
     대표 후보를 RELATED_CALL_BATCH_SIZE 단위로 나눠서 순차 확장하며,
     누적 실패율이 RELATED_CALL_ABORT_FAIL_RATE 이상이면(429 다발로 추정)
     남은 배치는 호출을 시도하지 않고 조기 중단한다.
+
+    [v19.5] 대표 후보 중 _sanitize_keyword_for_ads() 검사를 통과하지 못하는
+    키워드는 애초에 API 호출을 시도하지 않고 건너뛴다(HTTP 400 방지). 이
+    후보들은 429 조기중단 실패율 계산에도 포함되지 않는다.
     """
     if not hasattr(ads_api, "get_related_keywords"):
         if log:
@@ -455,8 +533,23 @@ def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=M
         return []
 
     reps = _select_representatives(survived)
+
+    # [v19.5] 실제 호출 전에 유효/무효 대표 후보를 먼저 나눈다.
+    valid_reps = []
+    invalid_rep_keywords = []
+    for rep in reps:
+        _, is_valid = _sanitize_keyword_for_ads(rep["keyword"])
+        if is_valid:
+            valid_reps.append(rep)
+        else:
+            invalid_rep_keywords.append(rep["keyword"])
+
     if log:
         log(f"[scorer] 2단계 연관검색어 확장 대상: {len(reps)}건 (카테고리별 상위 {MAX_RELATED_PER_CATEGORY}개)")
+        if invalid_rep_keywords:
+            log(f"[scorer] 2단계 ads API 호출 제외(무효 키워드) {len(invalid_rep_keywords)}건 "
+                f"- 특수문자/길이 제한 등으로 hintKeywords 형식에 부적합해 호출 자체를 시도하지 않음 "
+                f"(HTTP 400 방지)")
 
     expanded = []
     attempted = 0
@@ -464,10 +557,10 @@ def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=M
     aborted = False
     processed_reps = 0
 
-    for batch_start in range(0, len(reps), RELATED_CALL_BATCH_SIZE):
+    for batch_start in range(0, len(valid_reps), RELATED_CALL_BATCH_SIZE):
         if aborted:
             break
-        batch = reps[batch_start:batch_start + RELATED_CALL_BATCH_SIZE]
+        batch = valid_reps[batch_start:batch_start + RELATED_CALL_BATCH_SIZE]
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             futures = {executor.submit(_expand_related_one, ads_api, rep, tracker, log): rep for rep in batch}
             for future in as_completed(futures):
@@ -522,7 +615,7 @@ def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=M
         log(f"[scorer] 2단계 연관검색어 확장 결과: 시도 {attempted}건 / 실패 {fail_total}건 / "
             f"신규 후보 {len(result)}건")
         if aborted:
-            skipped_reps = len(reps) - processed_reps
+            skipped_reps = len(valid_reps) - processed_reps
             log(f"[scorer] 2단계 연관검색어 확장 API 429 다발로 조기중단 - 실패율 {fail_total}/{attempted} "
                 f"({(fail_total / attempted * 100):.0f}%)로 임계값({RELATED_CALL_ABORT_FAIL_RATE * 100:.0f}%) 초과, "
                 f"남은 {skipped_reps}건은 확장을 건너뜁니다.")
@@ -872,12 +965,9 @@ def _compute_efficiency(search_volume, doc_count):
     """
     [표시용 원시 효율값] search_volume/doc_count 그대로. UI 표시나 로그용으로 유지.
 
-    [v19.4 수정] doc_count가 None(문서수 미확인)인 경우, 과거에는 0으로 치환해
-    나눈 결과 검색량 값이 그대로 효율로 노출되는 표시 버그가 있었다.
-    이제는 doc_count가 None이면 계산을 하지 않고 0.0을 반환하며, 호출부에서
-    별도의 efficiency_unknown 플래그로 "문서수 미확인 -> 효율도 미확인"임을
-    명시적으로 구분한다. FinalScore 계산에는 이 원시값이 쓰이지 않으므로
-    점수 로직에는 영향이 없다.
+    doc_count가 None(문서수 미확인)인 경우 0.0을 반환한다. 화면 표시는
+    app.py가 efficiency_unknown 플래그와 함께 판단해 "-"/"확인 불가"로
+    대체한다. FinalScore 계산에는 이 원시값이 쓰이지 않는다.
     """
     if doc_count is None:
         return 0.0
@@ -946,8 +1036,10 @@ def _build_reason_tags(entry):
         tags.append("뉴스+검색 교차확인")
     if entry.get("mentions", 0) >= 5:
         tags.append("다수 매체 언급")
-    # 1단계 검색량 확인 관련 태그 (우선순위: 조기중단 > API실패 > 호출제한)
-    if entry.get("volume_call_aborted"):
+    # 1단계 검색량 확인 관련 태그 (우선순위: 무효키워드 > 조기중단 > API실패 > 호출제한)
+    if entry.get("volume_invalid_keyword"):
+        tags.append("검색량 키워드 형식 오류")
+    elif entry.get("volume_call_aborted"):
         tags.append("검색량 조회 중단(429)")
     elif entry.get("volume_api_failed"):
         tags.append("검색량 확인 실패")
@@ -992,10 +1084,10 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     if log:
         log(f"[scorer] 입력 후보 {len(candidates)}건, 5단계 검증 파이프라인 시작")
 
-    # ---- 1단계: 검색량 확인 (상위 250건 제한 + 429 대응) ----
+    # ---- 1단계: 검색량 확인 (상위 250건 제한 + 429/400 대응) ----
     survived_v, dropped_v, held_v = _check_search_volume(candidates, ads_api, tracker, cache, log, max_workers)
 
-    # ---- 2단계: 연관검색어 확장 (검색량 확인된 대표 후보에만, 429 대응) ----
+    # ---- 2단계: 연관검색어 확장 (검색량 확인된 대표 후보에만, 429/400 대응) ----
     expanded = _expand_related_keywords(survived_v, ads_api, tracker, log, max_workers)
     pool = _merge_pools(survived_v, expanded)
 
@@ -1072,10 +1164,6 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         entry["category_score"] = _compute_category_score(entry.get("category_weight", 1.0))
         entry["datalab_score"] = _compute_datalab_score(entry.get("datalab_ratio"))
         entry["efficiency"] = _compute_efficiency(entry["search_volume"], entry.get("doc_count"))
-
-        # [v19.4 신규] 문서수 미확인 시 효율도 확인 불가 상태임을 명시하는 플래그.
-        # app.py는 이 값과 doc_count is None 여부를 함께 확인해 효율 컬럼/문구를
-        # "-" 또는 "확인 불가"로 표시한다. FinalScore 계산에는 영향을 주지 않는다.
         entry["efficiency_unknown"] = entry.get("doc_count") is None
 
         entry["_brand_penalty_applied"] = (
@@ -1112,7 +1200,13 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
             entry["grade"] = "보류"
             entry["risk_reasons"] = []
             # 1단계(검색량) 관련 보류 사유를 3단계(문서수) 사유보다 먼저 확인한다.
-            if entry.get("volume_call_aborted"):
+            # [v19.5] 무효 키워드(HTTP 400)를 429/호출제한보다 먼저 확인해 원인을 명확히 구분한다.
+            if entry.get("volume_invalid_keyword"):
+                entry["hold_reasons"] = [
+                    "검색광고 API 키워드 형식 오류(특수문자/길이 제한 등)로 검색량 확인 불가"
+                    "(HTTP 400) - 검증보류로 처리"
+                ]
+            elif entry.get("volume_call_aborted"):
                 entry["hold_reasons"] = [
                     "검색량 조회 제한으로 일부 미확인 (429 다발로 1단계 조회 중단) - 검증보류로 처리"
                 ]
@@ -1209,10 +1303,19 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
             f"보류 {grade_counts.get('보류', 0)}, 위험 {grade_counts.get('위험', 0)}")
         log(f"[scorer] API 상태: 검색={api_health['search']}, "
             f"검색광고={api_health['ads']}, DataLab={api_health['datalab']}")
+
+        invalid_keyword_count = sum(1 for c in held_v if c.get("volume_invalid_keyword"))
         log(f"[scorer] 1단계 검색량: 저검색량 탈락 {len(dropped_v)}건 / "
-            f"API실패·호출제한·조기중단으로 보류 {len(held_v)}건")
+            f"API실패·호출제한·조기중단·무효키워드로 보류 {len(held_v)}건 "
+            f"(그중 무효키워드/HTTP 400 추정 {invalid_keyword_count}건)")
         log(f"[scorer] 문서수 미확인(API실패+호출제한+조회중단) {len(doc_unknown)}건, "
             f"DataLab 미조회(중립값 적용) {len(datalab_skip) + len(doc_unknown)}건")
+
+        # [v19.5 신규] ads API 실패 유형(400/429/기타) 구분 집계 출력
+        error_summary = tracker.error_summary()
+        if error_summary["http_400"] or error_summary["http_429"] or error_summary["other"]:
+            log(f"[scorer] ads API 실패 유형 집계 - HTTP 400(파라미터 오류) {error_summary['http_400']}회, "
+                f"HTTP 429(과다호출) {error_summary['http_429']}회, 기타 {error_summary['other']}회")
 
     return finalized, api_health
 
