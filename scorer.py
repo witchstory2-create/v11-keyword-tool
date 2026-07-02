@@ -1,44 +1,66 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v19.5)
+scorer.py (v19.6)
 네이버 블로그 수익형 키워드 발굴 시스템 - 검증/확장/점수화/등급분류 통합 엔진
 
 [파이프라인 내 위치]
   collector.collect_candidates() -> profit_filter.filter_candidates() -> scorer.score_candidates()
 
-[v19.5 변경 사항 - ads API HTTP 400(Bad Request) 대응 (최소 수정)]
+[v19.6 변경 사항 - ads API HTTP 400(Bad Request) 재발 대응: 공백 포함 키워드 문제]
 
-  문제: 로그에 "HTTP 400 - hintKeywords 파라미터가 유효하지 않습니다"가 다수
-  발생하고 있었다. 이는 429(과다 호출)와는 원인이 다른 문제로, ads API에
-  전달하는 키워드 자체의 형식(너무 긴 키워드, 특수문자 포함, 공백/기호 포함,
-  빈 문자열 등)이 hintKeywords 파라미터 규격에 맞지 않아 발생하는 것으로
-  판단된다. 속도를 늦추는 429 대응만으로는 이 문제를 해결할 수 없다.
+  v19.5에서는 _sanitize_keyword_for_ads()가 "한글/영문/숫자/공백"을 모두 허용
+  문자로 처리했다. 그 결과 "공적연금 수령", "대상 대환대출" 같이 공백을
+  포함한 키워드는 유효 키워드로 판정되어 그대로 ads API(hintKeywords)에
+  전달되었고, 로그 분석 결과 실제 HTTP 400이 발생하는 키워드는 거의 전부
+  공백을 포함하고 있었다. 즉 v19.5의 필터링 기준(특수문자/길이) 자체는
+  문제가 없었으나, "공백이 있는 키워드를 그대로 hintKeywords에 넣는 것"이
+  400의 실제 원인이었던 것으로 재확인되었다.
 
-  수정 내용:
-    1) _sanitize_keyword_for_ads() 신설: ads API(get_search_volume,
-       get_related_keywords)에 키워드를 넘기기 전에 다음을 검사한다.
-         - 앞뒤 공백 제거, 연속 공백은 하나로 정리
-         - 한글/영문/숫자/공백만 허용(특수문자가 하나라도 있으면 무효)
-         - 정리 후 길이가 MIN_KEYWORD_LENGTH_FOR_ADS ~
-           MAX_KEYWORD_LENGTH_FOR_ADS 범위를 벗어나면 무효
-    2) 1단계(_check_search_volume)와 2단계(_expand_related_keywords) 모두
-       실제 API 호출 배치를 시작하기 전에 유효/무효 키워드를 먼저 나눈다.
-       무효 키워드는 API를 호출하지 않고 곧바로 volume_invalid_keyword=True로
-       표시해 "보류"로 넘긴다. 429 조기중단 로직의 실패율 계산에는 무효
-       키워드가 섞이지 않도록, 배치 루프 자체에 무효 키워드를 포함시키지
-       않는다(호출 속도 문제와 파라미터 형식 문제를 서로 오염시키지 않음).
-    3) ApiHealthTracker에 record_error_type()/error_summary()를 추가해
-       ads API 실패 시 예외 메시지에 "400"이 포함되면 http_400, "429"가
-       포함되면 http_429, 그 외는 other로 구분해 집계한다. 분석 종료 시
-       로그에 이 3가지 수치를 출력해 400과 429를 구분할 수 있게 한다.
-    4) score_candidates()의 반환 형태((results, api_health) 튜플)와
-       api_health 딕셔너리 구조는 변경하지 않았다. 신규 필드
-       volume_invalid_keyword(bool)는 비파괴적 추가이므로 app.py 수정
-       없이 그대로 동작한다.
-    5) 문서수(3단계, search API)와 DataLab(4단계) 호출은 이번 문제(ads API
-       hintKeywords 400)와 무관하므로 변경하지 않았다.
+  수정 내용(이번 수정은 scorer.py만 변경하며, app.py/naver_search_api.py는
+  건드리지 않는다):
 
-[이하 v19.4/v19.3의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
+    1) 화면/로그에 노출되는 keyword(원본)는 절대 변경하지 않는다. candidates
+       리스트의 "keyword" 필드, 반환되는 entry들의 "keyword" 필드는 v19.5와
+       동일하게 공백을 포함한 원본 그대로 유지된다.
+
+    2) _sanitize_keyword_for_ads(raw_keyword)의 동작을 변경했다. 기존에는
+       연속 공백을 하나로 "정리"만 했지만, 이제는 ads API 호출에 사용할
+       cleaned_keyword를 만들 때 공백을 전부 제거한다("대출 신청" ->
+       "대출신청"). 그런 다음 이 공백 제거된 문자열을 기준으로
+       한글/영문/숫자만 허용하는지, 길이가 2~40자인지 검사한다. 이 함수는
+       여전히 (cleaned_keyword, is_valid) 튜플을 반환하며, 호출부의 사용
+       방식(1단계/2단계 사전 필터링)은 변경되지 않았다.
+
+    3) _fetch_volume_one() / _expand_related_one()에서 ads_api.get_search_volume(),
+       ads_api.get_related_keywords()를 호출할 때 이 공백 제거된
+       cleaned_keyword를 파라미터로 전달한다. API 응답 결과는 항상 원본
+       keyword(공백 포함)를 key로 캐시/딕셔너리에 저장해, 화면에는 원본
+       키워드 기준으로 그대로 매핑되어 표시된다(캐시 키, volume_map 키,
+       반환 튜플의 첫 번째 값 모두 원본 keyword 유지 - 이 부분은 v19.5와
+       동일).
+
+    4) API 호출이 실패했을 때(_safe_call 내부에서 예외 처리) 로그에
+       "original='...' cleaned='...'"  형태로 원본 키워드와 공백 제거된
+       cleaned_keyword를 함께 출력하도록 context 문자열을 수정했다. 이를
+       통해 HTTP 400이 재발할 경우 공백 제거 후에도 발생하는 것인지,
+       공백 제거로 해결된 것인지를 로그만으로 즉시 구분할 수 있다.
+
+    5) 2단계 연관검색어 확장에서 새로 발견되는 related keyword(네이버
+       API가 반환하는 연관검색어 자체)는 API가 원래 공백 없이 반환하는
+       경우가 많아 이번 수정과 무관하며, 변경하지 않았다.
+
+  이 수정으로 인해 API 호출 자체는 공백이 제거된 키워드로 나가지만,
+  score_candidates()가 반환하는 모든 entry의 "keyword" 필드, 로그에
+  노출되는 원본 표기, app.py가 그리는 화면상의 키워드 표기는 전부 사용자가
+  입력/수집된 원본(공백 포함) 그대로 유지된다.
+
+[이하 v19.5/v19.4/v19.3의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
+
+  v19.5: ads API HTTP 400(Bad Request) 대응. _sanitize_keyword_for_ads()
+  신설(당시에는 공백을 허용 문자로 처리). 1단계/2단계 모두 실제 API 호출
+  전에 유효/무효 키워드를 나눠 무효 키워드는 호출 자체를 하지 않고
+  volume_invalid_keyword=True로 보류 처리. ApiHealthTracker에
+  record_error_type()/error_summary() 추가해 400/429/기타 구분 집계.
 
   v19.4: 문서수를 확인하지 못한 보류 키워드의 효율(efficiency) 표시 버그
   수정. _compute_efficiency()가 doc_count=None을 0으로 치환해 나누던 것을
@@ -65,6 +87,8 @@ scorer.py (v19.5)
     volume_check_skipped (bool), volume_call_aborted (bool)
   - 신규 추가 필드(비파괴적 추가, v19.4): efficiency_unknown (bool)
   - 신규 추가 필드(비파괴적 추가, v19.5): volume_invalid_keyword (bool)
+  - v19.6에서는 신규 필드가 추가되지 않았다(ads API 호출 파라미터만 내부적으로
+    공백 제거 처리, 반환 필드 구조는 v19.5와 동일).
 
 표준 라이브러리만 사용 (math, time, random, re, threading, datetime, concurrent.futures)
 -> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
@@ -108,6 +132,7 @@ RELATED_CALL_ABORT_MIN_ATTEMPTS = 5
 RELATED_CALL_ABORT_FAIL_RATE = 0.3
 
 # [v19.5 신규] ads API(hintKeywords) 400 방지를 위한 키워드 유효성 검사 파라미터
+# (v19.6: 이 길이 기준은 "공백을 제거한 뒤"의 문자열 길이에 적용된다)
 MIN_KEYWORD_LENGTH_FOR_ADS = 2      # 정리 후 길이가 이보다 짧으면 호출하지 않음(운영 중 튜닝 가능)
 MAX_KEYWORD_LENGTH_FOR_ADS = 40     # 정리 후 길이가 이보다 길면 호출하지 않음(운영 중 튜닝 가능)
 
@@ -236,6 +261,9 @@ def _safe_call(fn, tracker, api_name, log=None, context=""):
         tracker.record(api_name, False)
         tracker.record_error_type(str(e))  # [v19.5 신규] 400/429/기타 구분 집계
         if log:
+            # [v19.6] context에 이미 "original=... cleaned=..." 형태가 담겨 있으므로
+            # 여기서는 그 문맥 문자열을 그대로 노출한다. HTTP 400 재발 시 원본
+            # 키워드와 공백 제거된 cleaned_keyword를 동시에 확인할 수 있다.
             log(f"[scorer] API 호출 실패 ({api_name}, {context}): {e}")
         return None
 
@@ -244,6 +272,10 @@ class _KeywordCache:
     """
     실행 중(score_candidates 1회 호출 동안) 동일 키워드에 대한
     중복 API 호출을 막기 위한 캐시. 스레드 안전.
+
+    [v19.6] 캐시 키는 항상 "원본 keyword"(공백 포함)를 사용한다. ads API에는
+    공백이 제거된 cleaned_keyword가 전달되지만, 그 결과는 원본 keyword를
+    key로 저장/조회하므로 화면/후속 로직에서는 원본 기준으로 그대로 매핑된다.
     """
 
     def __init__(self):
@@ -278,24 +310,36 @@ class _KeywordCache:
 
 
 # =========================================================================
-# 1B. [v19.5 신규] ads API(hintKeywords) 400 방지를 위한 키워드 유효성 검사
+# 1B. ads API(hintKeywords) 400 방지를 위한 키워드 유효성 검사
 # =========================================================================
-_KEYWORD_ALLOWED_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9 ]+$")
+# [v19.6] 이제 cleaned_keyword는 공백이 전부 제거된 문자열이므로, 허용 패턴에서
+# 공백을 제외했다(한글/영문/숫자만 허용).
+_KEYWORD_ALLOWED_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9]+$")
 
 
 def _sanitize_keyword_for_ads(raw_keyword):
     """
     ads API(hintKeywords)에 전달하기 전 키워드를 정리하고 유효성을 검사한다.
 
-    - 앞뒤 공백 제거, 연속 공백은 하나로 정리
-    - 한글/영문/숫자/공백만 허용(그 외 특수문자가 하나라도 포함되면 무효)
-    - 정리 후 길이가 MIN_KEYWORD_LENGTH_FOR_ADS ~ MAX_KEYWORD_LENGTH_FOR_ADS
-      범위를 벗어나면 무효
-    - 빈 문자열은 당연히 무효
+    [v19.6 변경] v19.5까지는 연속 공백을 하나로 "정리"만 하고 공백 자체는
+    유효 문자로 허용했다. 하지만 실제 운영 로그에서 HTTP 400이 발생하는
+    키워드가 대부분 공백을 포함하고 있는 것으로 확인되어, 이 함수가
+    반환하는 cleaned_keyword에서는 공백을 완전히 제거한다.
+    예) "대출 신청" -> "대출신청", "공적연금 수령" -> "공적연금수령"
+
+    처리 순서:
+      1) 원본 키워드에서 모든 공백 문자(스페이스/탭/개행 등)를 제거한다.
+      2) 제거 후 문자열이 비어 있으면 무효로 처리한다.
+      3) 한글/영문/숫자만 허용(그 외 특수문자가 하나라도 남아 있으면 무효).
+      4) 길이가 MIN_KEYWORD_LENGTH_FOR_ADS ~ MAX_KEYWORD_LENGTH_FOR_ADS
+         범위를 벗어나면 무효.
 
     이 함수를 통과하지 못한 키워드는 ads API(get_search_volume,
-    get_related_keywords) 호출 자체를 시도하지 않는다. 호출 실패(429 등)와는
-    원인이 다르므로 volume_invalid_keyword로 별도 표시한다.
+    get_related_keywords) 호출 자체를 시도하지 않는다.
+
+    주의: 이 함수가 반환하는 cleaned_keyword는 "API 호출 전용"이다. 화면에
+    표시되는 keyword(원본, 공백 포함)는 이 함수와 무관하게 candidates/entry의
+    "keyword" 필드에 그대로 유지되며, 이 함수의 결과로 덮어써지지 않는다.
 
     Returns
     -------
@@ -303,7 +347,8 @@ def _sanitize_keyword_for_ads(raw_keyword):
     """
     if not raw_keyword:
         return "", False
-    cleaned = re.sub(r"\s+", " ", raw_keyword.strip())
+    # 공백을 "정리"하는 것이 아니라 완전히 "제거"한다 (v19.6 핵심 변경).
+    cleaned = re.sub(r"\s+", "", raw_keyword.strip())
     if not cleaned:
         return cleaned, False
     if not _KEYWORD_ALLOWED_PATTERN.match(cleaned):
@@ -319,20 +364,24 @@ def _sanitize_keyword_for_ads(raw_keyword):
 def _fetch_volume_one(ads_api, keyword, tracker, log, cache):
     """
     이 함수는 이미 _sanitize_keyword_for_ads()를 통과한 keyword에 대해서만
-    호출된다(호출부인 _check_search_volume에서 사전 필터링). 실제 API에는
-    정리된(cleaned) 키워드를 전달한다.
+    호출된다(호출부인 _check_search_volume에서 사전 필터링).
 
-    반환값의 두 번째 요소는 int(검색량) 또는 None(API 호출 실패)이다.
+    [v19.6] 실제 ads API(get_search_volume)에는 공백이 제거된 cleaned_keyword를
+    전달한다. 하지만 캐시 저장/조회와 반환값의 key는 항상 원본 keyword(공백
+    포함)를 사용하므로, 화면/후속 로직에는 원본 키워드 기준으로 그대로
+    매핑되어 반영된다.
     """
     cached = cache.get_search_volume(keyword)
     if cached != "MISS":
         return keyword, cached
     cleaned, _ = _sanitize_keyword_for_ads(keyword)  # 이미 유효성 검사를 통과했으므로 cleaned만 사용
-    vol = _safe_call(lambda: ads_api.get_search_volume(cleaned), tracker, "ads", log, f"volume:{keyword}")
+    # [v19.6] 실패 로그에 원본과 cleaned를 함께 남기기 위해 context를 구성한다.
+    context = f"volume: original='{keyword}' cleaned='{cleaned}'"
+    vol = _safe_call(lambda: ads_api.get_search_volume(cleaned), tracker, "ads", log, context)
     time.sleep(0.3 + random.random() * 0.2)  # 0.08~0.16초 -> 0.3~0.5초
-    result = vol if isinstance(vol, int) else None  # None = API 호출 실패(429 등), 검색량 0과 구분
-    cache.set_search_volume(keyword, result)
-    return keyword, result
+    result = vol if isinstance(vol, int) else None  # None = API 호출 실패(429/400 등), 검색량 0과 구분
+    cache.set_search_volume(keyword, result)  # 캐시 key는 원본 keyword
+    return keyword, result  # 반환 key도 원본 keyword -> 화면에는 항상 원본으로 매핑됨
 
 
 def _select_volume_check_targets(candidates, limit=SEARCH_VOLUME_CHECK_LIMIT):
@@ -366,17 +415,23 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
     - 전체 후보가 아니라 mentions/intent_score/category_weight 기준 상위
       SEARCH_VOLUME_CHECK_LIMIT(250)건만 실제 ads API를 호출한다. 250건 밖
       후보는 volume_check_skipped=True로 표시해 "보류"로 넘긴다.
-    - [v19.5] 선정된 250건 중에서도 _sanitize_keyword_for_ads() 검사를
-      통과하지 못한 키워드(특수문자/길이 등 hintKeywords 형식 오류 가능성이
-      높은 키워드)는 애초에 API 호출 배치에 포함시키지 않고
+    - 선정된 250건 중에서도 _sanitize_keyword_for_ads() 검사를 통과하지
+      못한 키워드(공백 제거 후에도 특수문자/길이 등 hintKeywords 형식
+      오류가 남는 키워드)는 애초에 API 호출 배치에 포함시키지 않고
       volume_invalid_keyword=True로 표시해 "보류"로 넘긴다. 이 키워드들은
       429 조기중단 실패율 계산에도 포함되지 않는다(호출 속도 문제와
       파라미터 형식 문제를 서로 오염시키지 않기 위함).
+    - [v19.6] 위 유효성 검사는 이제 "공백을 제거한 뒤" 문자열을 기준으로
+      이루어진다. 즉 "공적연금 수령"처럼 공백만 있고 다른 특수문자가 없는
+      키워드는 v19.5까지는 유효로 판정되어 API에 공백 포함 그대로
+      전달되었지만, v19.6부터는 공백이 제거된 "공적연금수령"으로 판정/호출
+      된다(공백만 있는 키워드는 대부분 이 단계에서 유효로 남아 정상
+      호출되며, 실제 API에는 공백 없는 형태로 나간다).
     - 나머지 유효 키워드는 VOLUME_CALL_BATCH_SIZE 단위로 나눠서 순차 호출하며,
       누적 실패율이 VOLUME_CALL_ABORT_FAIL_RATE 이상이면(429 다발로 추정)
       남은 배치는 호출을 시도하지 않고 조기 중단한다. 중단된 키워드는
       volume_call_aborted=True로 표시한다.
-    - ads API 호출이 실패(429 등)한 키워드는 검색량 0으로 간주해 탈락시키지
+    - ads API 호출이 실패(429/400 등)한 키워드는 검색량 0으로 간주해 탈락시키지
       않고 volume_api_failed=True로 표시해 "보류"로 넘긴다.
     - 실제로 호출에 성공했는데 진짜 검색량이 MIN_SEARCH_VOLUME 미만인
       경우만 기존처럼 탈락(dropped) 처리한다.
@@ -387,10 +442,12 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
       - survived: 검색량 확인 성공 + MIN_SEARCH_VOLUME 이상
       - dropped : 검색량 확인 성공 + MIN_SEARCH_VOLUME 미만(진짜 저검색량, 탈락)
       - held    : 호출 제한/무효 키워드/API 실패/조기중단으로 검색량을 확인하지 못함(보류)
+
+    모든 반환 entry의 "keyword" 필드는 원본(공백 포함)이 그대로 유지된다.
     """
     selected_keywords, skipped_keywords = _select_volume_check_targets(candidates)
 
-    # [v19.5] 실제 호출 전에 유효/무효 키워드를 먼저 나눈다.
+    # 실제 호출 전에 유효/무효 키워드를 먼저 나눈다. (원본 keyword 기준 집합)
     valid_keywords = []
     invalid_keywords = set()
     for kw in selected_keywords:
@@ -416,7 +473,7 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
                 for kw in batch
             }
             for future in as_completed(futures):
-                kw, vol = future.result()
+                kw, vol = future.result()  # kw는 항상 원본 keyword
                 volume_map[kw] = vol
                 processed_keywords.add(kw)
                 attempted += 1
@@ -430,7 +487,7 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
 
     survived, dropped, held = [], [], []
     for c in candidates:
-        kw = c["keyword"]
+        kw = c["keyword"]  # 원본(공백 포함) 그대로
         entry = dict(c)
         entry["volume_check_skipped"] = kw in skipped_keywords
         entry["volume_call_aborted"] = kw in aborted_keywords
@@ -470,8 +527,8 @@ def _check_search_volume(candidates, ads_api, tracker, cache, log=None, max_work
             f"전체 {len(candidates)}건 중 {len(skipped_keywords)}건은 호출 제한으로 미확인)")
         if invalid_keywords:
             log(f"[scorer] 1단계 ads API 호출 제외(무효 키워드) {len(invalid_keywords)}건 "
-                f"- 특수문자/길이 제한 등으로 hintKeywords 형식에 부적합해 호출 자체를 시도하지 않음 "
-                f"(HTTP 400 방지)")
+                f"- 공백 제거 후에도 특수문자/길이 제한 등으로 hintKeywords 형식에 부적합해 "
+                f"호출 자체를 시도하지 않음 (HTTP 400 방지)")
         log(f"[scorer] 1단계 검색량 확인 결과 - 통과 {len(survived)}건 / "
             f"저검색량 탈락 {len(dropped)}건 / "
             f"API실패·호출제한·조기중단·무효키워드로 보류 {len(held)}건")
@@ -503,17 +560,21 @@ def _select_representatives(survived, per_category=MAX_RELATED_PER_CATEGORY):
 def _expand_related_one(ads_api, rep, tracker, log):
     """
     이 함수는 이미 _sanitize_keyword_for_ads()를 통과한 rep에 대해서만
-    호출된다(호출부인 _expand_related_keywords에서 사전 필터링). 실제 API에는
-    정리된(cleaned) 키워드를 전달한다.
+    호출된다(호출부인 _expand_related_keywords에서 사전 필터링).
+
+    [v19.6] 실제 ads API(get_related_keywords)에는 공백이 제거된
+    cleaned_keyword를 전달한다. 반환되는 related keyword 자체(연관검색어)는
+    이 함수가 손대지 않으며, 그대로 상위 호출부에서 사용된다.
     """
-    kw = rep["keyword"]
+    kw = rep["keyword"]  # 원본(공백 포함)
     cleaned, _ = _sanitize_keyword_for_ads(kw)  # 이미 유효성 검사를 통과했으므로 cleaned만 사용
+    context = f"related: original='{kw}' cleaned='{cleaned}'"
     related = _safe_call(
         lambda: ads_api.get_related_keywords(cleaned, limit=RELATED_LIMIT),
-        tracker, "ads", log, f"related:{kw}"
+        tracker, "ads", log, context
     )
     time.sleep(0.5 + random.random() * 0.3)  # 0.1~0.2초 -> 0.5~0.8초
-    failed = related is None  # 호출 자체가 실패한 경우(429 등)와 "연관검색어 없음"(빈 리스트)을 구분
+    failed = related is None  # 호출 자체가 실패한 경우(429/400 등)와 "연관검색어 없음"(빈 리스트)을 구분
     return rep, (related or []), failed
 
 
@@ -523,9 +584,10 @@ def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=M
     누적 실패율이 RELATED_CALL_ABORT_FAIL_RATE 이상이면(429 다발로 추정)
     남은 배치는 호출을 시도하지 않고 조기 중단한다.
 
-    [v19.5] 대표 후보 중 _sanitize_keyword_for_ads() 검사를 통과하지 못하는
-    키워드는 애초에 API 호출을 시도하지 않고 건너뛴다(HTTP 400 방지). 이
-    후보들은 429 조기중단 실패율 계산에도 포함되지 않는다.
+    대표 후보 중 _sanitize_keyword_for_ads() 검사를 통과하지 못하는(공백
+    제거 후에도 형식이 부적합한) 키워드는 애초에 API 호출을 시도하지
+    않고 건너뛴다(HTTP 400 방지). 이 후보들은 429 조기중단 실패율
+    계산에도 포함되지 않는다.
     """
     if not hasattr(ads_api, "get_related_keywords"):
         if log:
@@ -534,7 +596,7 @@ def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=M
 
     reps = _select_representatives(survived)
 
-    # [v19.5] 실제 호출 전에 유효/무효 대표 후보를 먼저 나눈다.
+    # 실제 호출 전에 유효/무효 대표 후보를 먼저 나눈다.
     valid_reps = []
     invalid_rep_keywords = []
     for rep in reps:
@@ -548,8 +610,8 @@ def _expand_related_keywords(survived, ads_api, tracker, log=None, max_workers=M
         log(f"[scorer] 2단계 연관검색어 확장 대상: {len(reps)}건 (카테고리별 상위 {MAX_RELATED_PER_CATEGORY}개)")
         if invalid_rep_keywords:
             log(f"[scorer] 2단계 ads API 호출 제외(무효 키워드) {len(invalid_rep_keywords)}건 "
-                f"- 특수문자/길이 제한 등으로 hintKeywords 형식에 부적합해 호출 자체를 시도하지 않음 "
-                f"(HTTP 400 방지)")
+                f"- 공백 제거 후에도 특수문자/길이 제한 등으로 hintKeywords 형식에 부적합해 "
+                f"호출 자체를 시도하지 않음 (HTTP 400 방지)")
 
     expanded = []
     attempted = 0
@@ -653,6 +715,11 @@ def _select_doc_check_targets(pool, limit=DOC_COUNT_CHECK_LIMIT):
 
 
 def _fetch_doc_count_one(search_api, keyword, tracker, log, cache):
+    """
+    [참고] 문서수 조회는 검색(search) API를 사용하며, 이번 v19.6 수정
+    대상(ads API hintKeywords 400 이슈)과 무관하므로 keyword를 그대로
+    전달한다. 요청사항에 따라 naver_search_api.py는 수정하지 않았다.
+    """
     cached = cache.get_doc_count(keyword)
     if cached != "MISS":
         return keyword, cached
@@ -1066,7 +1133,8 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     Parameters
     ----------
     candidates : list[dict]
-        profit_filter.filter_candidates()의 출력.
+        profit_filter.filter_candidates()의 출력. 각 항목의 "keyword"는
+        원본(공백 포함 가능) 그대로다.
     apis : dict
         {"search": NaverSearchAPI, "ads": NaverAdsAPI, "datalab": NaverDataLabAPI}
     log : callable | None
@@ -1074,6 +1142,9 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     Returns
     -------
     (results, api_health) : tuple[list[dict], dict]
+        results의 각 entry["keyword"]는 항상 입력 candidates의 원본 keyword와
+        동일하다(v19.6에서 ads API 호출용으로만 공백을 제거했을 뿐, 화면/결과에
+        노출되는 keyword는 절대 변경하지 않는다).
     """
     tracker = ApiHealthTracker()
     cache = _KeywordCache()
@@ -1084,10 +1155,10 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     if log:
         log(f"[scorer] 입력 후보 {len(candidates)}건, 5단계 검증 파이프라인 시작")
 
-    # ---- 1단계: 검색량 확인 (상위 250건 제한 + 429/400 대응) ----
+    # ---- 1단계: 검색량 확인 (상위 250건 제한 + 429/400 대응, ads API 호출은 공백 제거 keyword 사용) ----
     survived_v, dropped_v, held_v = _check_search_volume(candidates, ads_api, tracker, cache, log, max_workers)
 
-    # ---- 2단계: 연관검색어 확장 (검색량 확인된 대표 후보에만, 429/400 대응) ----
+    # ---- 2단계: 연관검색어 확장 (검색량 확인된 대표 후보에만, 429/400 대응, ads API 호출은 공백 제거 keyword 사용) ----
     expanded = _expand_related_keywords(survived_v, ads_api, tracker, log, max_workers)
     pool = _merge_pools(survived_v, expanded)
 
@@ -1200,11 +1271,11 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
             entry["grade"] = "보류"
             entry["risk_reasons"] = []
             # 1단계(검색량) 관련 보류 사유를 3단계(문서수) 사유보다 먼저 확인한다.
-            # [v19.5] 무효 키워드(HTTP 400)를 429/호출제한보다 먼저 확인해 원인을 명확히 구분한다.
+            # 무효 키워드(HTTP 400)를 429/호출제한보다 먼저 확인해 원인을 명확히 구분한다.
             if entry.get("volume_invalid_keyword"):
                 entry["hold_reasons"] = [
-                    "검색광고 API 키워드 형식 오류(특수문자/길이 제한 등)로 검색량 확인 불가"
-                    "(HTTP 400) - 검증보류로 처리"
+                    "검색광고 API 키워드 형식 오류(공백 제거 후에도 특수문자/길이 제한 등)로 "
+                    "검색량 확인 불가(HTTP 400) - 검증보류로 처리"
                 ]
             elif entry.get("volume_call_aborted"):
                 entry["hold_reasons"] = [
@@ -1311,7 +1382,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         log(f"[scorer] 문서수 미확인(API실패+호출제한+조회중단) {len(doc_unknown)}건, "
             f"DataLab 미조회(중립값 적용) {len(datalab_skip) + len(doc_unknown)}건")
 
-        # [v19.5 신규] ads API 실패 유형(400/429/기타) 구분 집계 출력
+        # ads API 실패 유형(400/429/기타) 구분 집계 출력
         error_summary = tracker.error_summary()
         if error_summary["http_400"] or error_summary["http_429"] or error_summary["other"]:
             log(f"[scorer] ads API 실패 유형 집계 - HTTP 400(파라미터 오류) {error_summary['http_400']}회, "
@@ -1326,8 +1397,11 @@ if __name__ == "__main__":
 
     class _DummyAds:
         def get_search_volume(self, keyword):
+            # [테스트용] 실제로는 공백이 제거된 keyword가 여기로 들어와야 한다.
+            assert " " not in keyword, f"공백이 제거되지 않은 채 API에 전달됨: {keyword!r}"
             return 5000
         def get_related_keywords(self, keyword, limit=30):
+            assert " " not in keyword, f"공백이 제거되지 않은 채 API에 전달됨: {keyword!r}"
             return [{"keyword": f"{keyword} 신청", "total_volume": 3000}]
 
     class _DummySearch:
@@ -1339,13 +1413,13 @@ if __name__ == "__main__":
             return 1.6
 
     dummy_candidates = [
-        {"keyword": "민생지원금", "category": "지원금", "anchor": "지원금",
-         "intent_word": None, "mentions": 12, "sample_titles": [],
-         "seed_query": "민생지원금", "first_pub_date": "2026-06-28", "latest_pub_date": "2026-06-30",
+        {"keyword": "공적연금 수령", "category": "지원금", "anchor": "연금",
+         "intent_word": "수령", "mentions": 12, "sample_titles": [],
+         "seed_query": "공적연금 수령", "first_pub_date": "2026-06-28", "latest_pub_date": "2026-06-30",
          "intent_score": 0.5, "category_weight": 1.5, "category_meta": {"cpc": "high"}, "source": ["news"]},
     ]
     apis = {"search": _DummySearch(), "ads": _DummyAds(), "datalab": _DummyDataLab()}
     results, health = score_candidates(dummy_candidates, apis, log=_print_log)
     for r in results:
-        print(r)
+        print(r["keyword"], "->", r["grade"], r.get("search_volume"))
     print("api_health:", health)
