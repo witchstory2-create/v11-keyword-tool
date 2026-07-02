@@ -1,7 +1,18 @@
 # -*- coding: utf-8 -*-
 """
-app.py (v20)
+app.py (v20.1)
 네이버 블로그 수익형 키워드 발굴 시스템 - 대시보드형 UI
+
+[v20.1 변경 사항 - 효율(efficiency) 표시 버그 수정 (최소 수정)]
+  문서수(doc_count)를 확인하지 못한 보류 키워드의 경우, 기존에는 효율 컬럼에
+  검색량 값이 그대로 노출되는 버그가 있었다(예: 검색량 4,460 / 문서수 '-' 인데
+  효율이 4460.00으로 표시). scorer.py v19.4가 반환하는 efficiency_unknown
+  필드와 doc_count is None 여부를 함께 확인해, 다음 세 곳에서 효율을
+  "-" 또는 "확인 불가"로 표시하도록 수정했다.
+    1) _render_table(): 메인 표의 "효율" 컬럼 -> "-"
+    2) DetailPanel.show(): 우측 상세 패널의 "검색량/문서수 효율" 문구 -> "확인 불가"
+    3) generate_draft_text(): 글초안 하단 안내 문구의 문서수/효율 -> "확인 불가"
+  UI 구조, 파이프라인 호출 순서, API 연동 로직은 전혀 변경하지 않았다.
 
 [v20 변경 사항 - 최소 수정]
 1) 키워드 복사 기능 추가: 결과 표에서 더블클릭 / Ctrl+C / 우클릭(컨텍스트 메뉴)
@@ -52,7 +63,7 @@ from naver_search_api import (
 )
 
 APP_TITLE = "오늘의 수익형 키워드 발굴기"
-APP_VERSION = "v20"
+APP_VERSION = "v20.1"
 
 BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
@@ -183,7 +194,7 @@ class SettingsDialog(tk.Toplevel):
         return self.cfg
 
     # -----------------------------------------------------------------
-    # [v20 수정] 연결 테스트는 이 창의 상태 라벨(status1/status2)에만 결과를
+    # 연결 테스트는 이 창의 상태 라벨(status1/status2)에만 결과를
     # 표시하고, 더 이상 self.cfg["api_status"]를 덮어쓰지 않는다.
     # 메인 화면의 "API 상태"는 오직 분석 종료 후 api_health로만 갱신된다.
     # -----------------------------------------------------------------
@@ -291,6 +302,17 @@ def generate_draft_text(data):
     kw = data.get("keyword", "")
     cat = data.get("category", "")
     timing = data.get("timing", "상시")
+
+    # [v20.1 효율 표시 버그 수정] 문서수를 확인하지 못한 경우(doc_count is None)
+    # 또는 scorer.py에서 efficiency_unknown=True로 표시된 경우, 글초안 하단
+    # 안내 문구에 문서수 0건 / 효율값이 검색량 그대로 잘못 노출되던 문제를
+    # 막기 위해 "확인 불가"로 표시한다. doc_count가 정상 확인된 경우는
+    # 기존과 동일하게 숫자로 표시한다.
+    doc_count = data.get("doc_count")
+    efficiency_unknown = doc_count is None or data.get("efficiency_unknown", False)
+    doc_count_text = f"{doc_count:,}" if doc_count is not None else "확인 불가"
+    efficiency_text = "확인 불가" if efficiency_unknown else f"{data.get('efficiency', 0):.2f}"
+
     lines = [
         f"[글초안] {kw}",
         "",
@@ -308,8 +330,8 @@ def generate_draft_text(data):
         "3. 결론",
         f"   {kw} 핵심 요약과 행동 유도(신청 링크, 관련 글 안내) 문단으로 마무리합니다.",
         "",
-        f"※ 검색량 {data.get('search_volume', 0):,} / 문서수 {data.get('doc_count', 0) or 0:,} "
-        f"/ 효율 {data.get('efficiency', 0):.2f} 기준 초안입니다.",
+        f"※ 검색량 {data.get('search_volume', 0):,} / 문서수 {doc_count_text} "
+        f"/ 효율 {efficiency_text} 기준 초안입니다.",
     ]
     return "\n".join(lines)
 
@@ -399,10 +421,16 @@ class DetailPanel(ttk.Frame):
         doc_count = data.get("doc_count")
         doc_count_text = f"{doc_count:,}" if doc_count is not None else "확인 불가"
 
+        # [v20.1 효율 표시 버그 수정] 문서수 미확인 시 효율도 "확인 불가"로 표시한다.
+        # (scorer.py에서 doc_count is None이면 efficiency는 0.0으로만 유지되므로
+        # 화면에는 그 값을 그대로 노출하지 않고 별도 텍스트로 대체한다.)
+        efficiency_unknown = doc_count is None or data.get("efficiency_unknown", False)
+        efficiency_text = "확인 불가" if efficiency_unknown else f"{data.get('efficiency', 0):.2f}"
+
         self.stat_text.config(text=(
             f"검색량 : {data.get('search_volume', 0):,}\n"
             f"문서수 : {doc_count_text}\n"
-            f"검색량/문서수 효율 : {data.get('efficiency', 0):.2f}\n"
+            f"검색량/문서수 효율 : {efficiency_text}\n"
             f"작성 타이밍 : {data.get('timing', '상시')}\n"
             f"예상 수익성 : {profit_label(data)}\n"
             f"출처 : {', '.join(data.get('source', []))}"
@@ -448,7 +476,7 @@ class WritingPanel(ttk.Frame):
         top.pack(fill="x", pady=(0, 4))
         self.gen_btn = ttk.Button(top, text="✎ 콘텐츠 생성", command=self._generate, state="disabled")
         self.gen_btn.pack(side="left")
-        # [v20] 보류도 생성 가능 -> 안내 문구 수정
+        # 보류도 생성 가능 -> 안내 문구 수정
         self.hint_label = ttk.Label(top, text="위험 등급 키워드는 콘텐츠 생성이 불가능합니다.",
                                      foreground="#999999")
         self.hint_label.pack(side="left", padx=(10, 0))
@@ -474,7 +502,7 @@ class WritingPanel(ttk.Frame):
 
     def set_selected(self, data):
         self.data = data
-        # [v20 수정] TOP5/TOP10 뿐 아니라 "보류"도 생성 가능. "위험"만 차단.
+        # TOP5/TOP10 뿐 아니라 "보류"도 생성 가능. "위험"만 차단.
         if data and data.get("grade") in ALLOWED_DRAFT_GRADES:
             self.gen_btn.config(state="normal")
             self.hint_label.config(text="")
@@ -509,14 +537,14 @@ class App(tk.Tk):
         self.queue = queue.Queue()
         self.worker_thread = None
         self.item_map = {}  # treeview row id -> data dict
-        self._status_after_id = None  # [v20] 상태바 메시지 자동 소거용
+        self._status_after_id = None  # 상태바 메시지 자동 소거용
 
         self._build_menu()
         self._build_header()
         self._build_summary_bar()
         self._build_body()
         self._build_writing_panel()
-        self._build_status_bar()  # [v20 신규] 반드시 다른 위젯들보다 나중에 pack (맨 아래 위치)
+        self._build_status_bar()  # 반드시 다른 위젯들보다 나중에 pack (맨 아래 위치)
         self._poll_queue()
 
     # ---------------------------------------------------------------
@@ -609,7 +637,7 @@ class App(tk.Tk):
         self.summary_labels["위험"].config(text=str(counts["위험"]))
         self.summary_labels["성공률"].config(text=f"{rate:.0f}%")
 
-        # [v20] 이 값은 오직 scorer.score_candidates()가 반환한 api_health
+        # 이 값은 오직 scorer.score_candidates()가 반환한 api_health
         # (실제 분석 결과)로만 갱신된다. 설정창의 연결 테스트 버튼은 더 이상
         # 이 값을 건드리지 않는다.
         status = self.cfg.get("api_status", {})
@@ -668,7 +696,7 @@ class App(tk.Tk):
 
         self.tree.bind("<<TreeviewSelect>>", self._on_select_row)
 
-        # [v20 신규] 키워드 복사 기능 - 더블클릭 / Ctrl+C / 우클릭
+        # 키워드 복사 기능 - 더블클릭 / Ctrl+C / 우클릭
         self.tree.bind("<Double-1>", self._on_tree_double_click)
         self.tree.bind("<Control-c>", self._on_tree_ctrl_c)
         self.tree.bind("<Button-3>", self._on_tree_right_click)
@@ -681,7 +709,7 @@ class App(tk.Tk):
         self.detail_panel.pack(fill="both", expand=True)
 
     # ---------------------------------------------------------------
-    # [v20 신규] 키워드 복사 기능
+    # 키워드 복사 기능
     # ---------------------------------------------------------------
     def _build_context_menu(self):
         self.context_menu = tk.Menu(self, tearoff=0)
@@ -729,7 +757,7 @@ class App(tk.Tk):
         self.writing_panel.pack(fill="both", expand=True)
 
     # ---------------------------------------------------------------
-    # [v20 신규] 하단 상태바 - 복사 완료 등의 안내 메시지 표시
+    # 하단 상태바 - 복사 완료 등의 안내 메시지 표시
     # ---------------------------------------------------------------
     def _build_status_bar(self):
         self.status_bar = ttk.Label(self, text="준비", anchor="w",
@@ -785,7 +813,7 @@ class App(tk.Tk):
                 self._open_settings()
             return
 
-        # [v20 신규] 이번 분석 실행의 429/timeout 집계를 초기화
+        # 이번 분석 실행의 429/timeout 집계를 초기화
         reset_retry_stats()
 
         self.run_btn.config(state="disabled")
@@ -829,7 +857,7 @@ class App(tk.Tk):
                 f"광고:{api_health.get('ads')} DataLab:{api_health.get('datalab')}"
             )
 
-            # [v20 신규] 429/timeout 실제 발생 횟수 로그
+            # 429/timeout 실제 발생 횟수 로그
             retry_stats = get_retry_stats()
             self._log(
                 f"API 재시도 집계 - 429 발생 {retry_stats.get('count_429', 0)}회, "
@@ -899,6 +927,15 @@ class App(tk.Tk):
                 rank_text = MEDALS.get(overall_rank, str(overall_rank))
                 doc_count = d.get("doc_count")
                 doc_count_text = f"{doc_count:,}" if doc_count is not None else "-"
+
+                # [v20.1 효율 표시 버그 수정] 문서수를 확인하지 못한 경우
+                # (doc_count is None) 또는 scorer.py에서 efficiency_unknown=True로
+                # 표시된 경우, 효율을 검색량 값으로 잘못 표시하던 문제를 막기 위해
+                # "-"로 표시한다. doc_count가 정상 확인된 경우는 기존과 동일하게
+                # 숫자로 표시한다.
+                efficiency_unknown = doc_count is None or d.get("efficiency_unknown", False)
+                efficiency_text = "-" if efficiency_unknown else f"{d.get('efficiency', 0):.2f}"
+
                 row_id = self.tree.insert(
                     group_id, "end", text=rank_text,
                     values=(
@@ -906,7 +943,7 @@ class App(tk.Tk):
                         d.get("category", "-"),
                         f"{d.get('search_volume', 0):,}",
                         doc_count_text,
-                        f"{d.get('efficiency', 0):.2f}",
+                        efficiency_text,
                         profit_label(d),
                     ),
                     tags=(f"row_{g}",)
