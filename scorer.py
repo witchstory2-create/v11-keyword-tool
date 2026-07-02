@@ -1,12 +1,30 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v19)
+scorer.py (v19.1)
 네이버 블로그 수익형 키워드 발굴 시스템 - 검증/확장/점수화/등급분류 통합 엔진
 
 [파이프라인 내 위치]
   collector.collect_candidates() -> profit_filter.filter_candidates() -> scorer.score_candidates()
 
-[v19 변경 사항 - "실제 블로그 수익 가능성" 중심 재설계]
+[v19.1 변경 사항 - 문서수 조회 상한 확대 (최소 수정)]
+
+  문제: DOC_COUNT_CHECK_LIMIT=50으로 제한되어 있어, 상위 50건 외 후보는
+  문서수 API를 호출하지 않고 doc_count=None으로 남아 "보류" 등급 키워드의
+  문서수가 화면에 '-'로만 표시되는 문제가 있었다.
+
+  수정: DOC_COUNT_CHECK_LIMIT 값만 50 -> 150으로 상향. 이 상수는
+  _select_doc_check_targets()에서 그대로 참조되므로, 파이프라인 구조/
+  함수 시그니처/반환 필드는 전혀 변경되지 않는다. DOC_MAX_WORKERS(2)와
+  호출 간 sleep(0.15~0.30초)은 429 방지를 위해 기존과 동일하게 유지했다.
+  조회 대상이 3배 늘어나는 만큼 문서수 확인 단계의 총 소요 시간도 대략
+  3배 늘어날 수 있으니, 실행 후 429/timeout 발생 빈도를 로그로 확인 권장.
+
+  doc_count가 실제로 조회된 보류 키워드는 기존과 동일하게 doc_count에
+  정상 숫자가 채워지고, doc_count=None인 경우(API 실패 또는 상위 150건
+  밖으로 여전히 미조회)만 그대로 None으로 유지되어 app.py에서 '-'로
+  표시된다.
+
+[이하 v19의 설계 배경/로직 설명은 변경 없음 - 참고용으로 유지]
 
   이전 버전(v18.8)의 한계: OpportunityScore가 log(검색량)/log(문서수) 비율
   기반이라, 검색량 자체가 매우 큰 키워드(예: 검색량 130,000 / 문서수
@@ -14,41 +32,18 @@ scorer.py (v19)
   같은 범용/기관 키워드가 TOP5에 올라오는 문제가 있었다.
 
   1) EfficiencyScore 신설: 검색량/문서수 비율을 log10(효율+1) 기반으로
-     0~10 스케일로 환산한 독립 점수. 비율 자체보다 "효율이 얼마나
-     압도적인가"에 더 민감하게 반응하도록 설계.
+     0~10 스케일로 환산한 독립 점수.
+  2) 문서수 절대값 페널티 강화 (5단계): 100만↑ x0.05, 50만↑ x0.15,
+     30만↑ x0.3, 10만↑ x0.6, 5만↑ x0.8
+  3) 검색량 게이트 3단: 500 미만 50%감점 / 300 미만 TOP5 제외 /
+     100 미만 TOP10도 제외(무조건 보류)
+  4) 브랜드/기관명 페널티(x0.5): 공단/심사평가원/정부24/네이버/카카오/
+     삼성/현대 등. 문서수 페널티/범용어 앵커 페널티와는 곱하지 않고
+     셋 중 가장 강한 배수 하나만 적용.
+  5) FinalScore = Opportunity*0.45 + Efficiency*0.25 + Category*0.15
+                  + Issue*0.10 + DataLab*0.05
 
-  2) 문서수 절대값 페널티 강화 (기존 4단계 -> 5단계):
-       - 문서수 >= 1,000,000 -> x0.05  (기존 x0.1 에서 강화)
-       - 문서수 >=   500,000 -> x0.15  (기존 x0.3 에서 강화)
-       - 문서수 >=   300,000 -> x0.3   (신규 추가)
-       - 문서수 >=   100,000 -> x0.6   (기존과 동일)
-       - 문서수 >=    50,000 -> x0.8   (기존과 동일)
-
-  3) 검색량 게이트 3단으로 확장:
-       - 검색량 < 500 -> OpportunityScore 50% 추가 감점 (기존 300에서 상향)
-       - 검색량 < 300 -> TOP5 후보에서 제외 (기존 100에서 상향)
-       - 검색량 < 100 -> TOP10 후보에서도 제외, 무조건 "보류" (신규)
-
-  4) 브랜드/기관명 페널티 신설: 키워드에 "공단", "심사평가원", "정부24",
-     "네이버", "카카오", "삼성", "현대" 등 기관/대기업 명칭이 포함되면
-     OpportunityScore를 x0.5로 감점. 문서수 페널티/범용어 앵커 페널티와는
-     곱하지 않고 셋 중 가장 강한(작은) 배수 하나만 적용한다.
-
-  5) FinalScore 가중치 재조정 (Efficiency 신설로 재분배):
-       FinalScore = Opportunity*0.45 + Efficiency*0.25 + Category*0.15
-                    + Issue*0.10 + DataLab*0.05
-
-  [UI 표시 관련 별도 안내]
-  요청하신 "★★★★★ / 경쟁도: 매우 높음 / 추천도 18% / 노출 난이도: 어려움"
-  같은 사용자 친화적 표시는 scorer.py의 계산 결과(final_score, efficiency,
-  doc_count, competition 등)를 app.py에서 가공해 보여주는 화면 로직이다.
-  scorer.py v19가 반환하는 필드만으로도 계산은 충분히 가능하므로,
-  이 알고리즘이 실데이터로 안정화된 뒤 app.py 쪽 표시 로직을 별도로
-  다음 단계에서 반영하는 것을 권장한다.
-
-[출력 계약] score_candidates()는 (results, api_health) 튜플을 반환한다. (v18.x와 동일 필드 유지)
-  - 신규 추가 필드(비파괴적 추가): efficiency_score
-    (category_score, datalab_score는 v18.8에서 이미 추가됨)
+[출력 계약] score_candidates()는 (results, api_health) 튜플을 반환한다. (v19와 동일 필드 유지)
 
 표준 라이브러리만 사용 (math, time, random, threading, datetime, concurrent.futures)
 -> PyInstaller / GitHub Actions 빌드 100% 호환. 외부 pip 패키지 없음.
@@ -79,29 +74,29 @@ TOP5_SIZE = 5
 TOP10_SIZE = 10                 # TOP5 이후 순위 6~15
 MAX_WORKERS = 4                 # 1단계(검색량)/2단계(연관검색어) 병렬 수
 
-DOC_COUNT_CHECK_LIMIT = 50       # 문서수 조회는 검색량×의도점수 상위 50건까지만 실제 호출
+# [v19.1] 50 -> 150 으로 상향 (보류 키워드도 문서수를 확인할 수 있도록)
+DOC_COUNT_CHECK_LIMIT = 150      # 문서수 조회는 검색량×의도점수 상위 150건까지만 실제 호출
 DATALAB_CHECK_LIMIT = 25         # DataLab 조회는 문서수 확인된 후보 중 효율 상위 25건까지만 실제 호출
-DOC_MAX_WORKERS = 2              # 문서수 조회 병렬 수 축소 (429 방지)
-DATALAB_MAX_WORKERS = 1          # DataLab 조회는 순차 처리 (timeout 방지)
+DOC_MAX_WORKERS = 2              # 문서수 조회 병렬 수 (429 방지, 변경 없음)
+DATALAB_MAX_WORKERS = 1          # DataLab 조회는 순차 처리 (timeout 방지, 변경 없음)
 
 # 범용/상시성 앵커 - "위험" 등급 및 OpportunityScore 감점에 함께 사용
 GENERIC_RISK_ANCHORS = {"보험", "대출", "연금", "세금", "카드", "부동산", "청약"}
 
-# ---- [v19] FinalScore 가중치 (Efficiency 신설로 재분배) ----
+# ---- FinalScore 가중치 (Efficiency 신설로 재분배, v19와 동일) ----
 WEIGHT_OPPORTUNITY = 0.45
 WEIGHT_EFFICIENCY = 0.25
 WEIGHT_CATEGORY = 0.15
 WEIGHT_ISSUE = 0.10
 WEIGHT_DATALAB = 0.05
 
-# ---- [v19] 검색량 게이트 3단 ----
+# ---- 검색량 게이트 3단 (v19와 동일) ----
 LOW_VOLUME_PENALTY_CUT = 500        # 이 미만이면 OpportunityScore 50% 추가 감점
 LOW_VOLUME_PENALTY_MULTIPLIER = 0.5
 TOP5_MIN_SEARCH_VOLUME = 300        # 이 미만이면 TOP5 후보에서 제외
 TOP10_MIN_SEARCH_VOLUME = 100       # 이 미만이면 TOP10 후보에서도 제외 (무조건 보류)
 
-# ---- [v19] 문서수 절대값 페널티 강화 (OpportunityScore 대상) ----
-# 임계값이 큰 것부터 순서대로 검사한다.
+# ---- 문서수 절대값 페널티 (v19와 동일) ----
 DOC_COUNT_PENALTY_TIERS = [
     (1_000_000, 0.05),
     (500_000, 0.15),
@@ -110,28 +105,26 @@ DOC_COUNT_PENALTY_TIERS = [
     (50_000, 0.8),
 ]
 
-# ---- 범용 상시 키워드(앵커) 감점 (기존과 동일) ----
+# ---- 범용 상시 키워드(앵커) 감점 (v19와 동일) ----
 GENERIC_ANCHOR_DOC_THRESHOLD = RISK_DOC_ABS   # 50,000
 GENERIC_ANCHOR_PENALTY_MULTIPLIER = 0.15
 
-# ---- [v19 신규] 브랜드/기관명 페널티 ----
+# ---- 브랜드/기관명 페널티 (v19와 동일) ----
 BRAND_INSTITUTION_KEYWORDS = {
     "공단", "심사평가원", "정부24", "네이버", "카카오", "삼성", "현대",
     "국민건강보험", "근로복지공단", "국세청", "국민연금공단",
 }
 BRAND_INSTITUTION_PENALTY_MULTIPLIER = 0.5
 
-# ---- doc_count 미확인 시 FinalScore 계산용 중립값 (Opportunity/Efficiency 공통) ----
-OPPORTUNITY_NEUTRAL_FOR_UNKNOWN_DOC = 3.0     # 0~10 스케일 기준 보수적으로 낮게 설정
+# ---- doc_count 미확인 시 FinalScore 계산용 중립값 (v19와 동일) ----
+OPPORTUNITY_NEUTRAL_FOR_UNKNOWN_DOC = 3.0
 EFFICIENCY_NEUTRAL_FOR_UNKNOWN_DOC = 3.0
 
-# ---- 브랜드/롱테일 가산 (기존과 동일, 감점 이후 마지막에 적용) ----
-LONGTAIL_MIN_LENGTH = 6             # 공백 제거 후 길이가 이 이상이면 롱테일로 간주
+# ---- 브랜드/롱테일 가산 (v19와 동일) ----
+LONGTAIL_MIN_LENGTH = 6
 BRAND_LONGTAIL_MAX_BONUS = 1.5
 
-# ---- [v19 신규] EfficiencyScore 스케일 계수 ----
-# 효율(=검색량/문서수)이 10일 때 약 5.2점, 50일 때 약 8.5점, 100 이상이면
-# 만점(10점)에 도달하도록 설정한 초기값. 실데이터 분포를 보고 조정 가능.
+# ---- EfficiencyScore 스케일 계수 (v19와 동일) ----
 EFFICIENCY_LOG_SCALE = 5.0
 
 
@@ -365,7 +358,7 @@ def _merge_pools(survived, expanded):
 
 
 # =========================================================================
-# 4. 3단계: 문서수 확인 (상위 50건 제한)
+# 4. 3단계: 문서수 확인 (v19.1: 상위 150건 제한)
 # =========================================================================
 def _select_doc_check_targets(pool, limit=DOC_COUNT_CHECK_LIMIT):
     """검색량×의도점수 기준 상위 limit건만 실제 문서수 조회 대상으로 선정."""
@@ -532,7 +525,7 @@ def _compute_issue_score(mentions, freshness, datalab_ratio):
 
 
 def _doc_count_penalty_multiplier(doc_count):
-    """[v19] 문서수 절대값 구간별 페널티 배수(5단계로 강화). 구간에 해당 없으면 1.0."""
+    """문서수 절대값 구간별 페널티 배수(5단계). 구간에 해당 없으면 1.0."""
     if doc_count is None:
         return 1.0
     for threshold, multiplier in DOC_COUNT_PENALTY_TIERS:
@@ -555,7 +548,7 @@ def _generic_anchor_penalty_multiplier(anchor, intent_word, doc_count):
 
 def _brand_institution_penalty_multiplier(keyword):
     """
-    [v19 신규] 키워드에 기관/대기업 명칭이 포함되면 x0.5 감점.
+    키워드에 기관/대기업 명칭이 포함되면 x0.5 감점.
     다른 감점(문서수/범용어 앵커)과는 곱하지 않고 min()으로만 비교한다.
     """
     if not keyword:
@@ -570,7 +563,6 @@ def _brand_longtail_bonus_multiplier(keyword, intent_word, anchor):
     """
     [휴리스틱] 검색 의도가 명확하거나(intent_word 존재) 앵커보다 구체적인
     롱테일 키워드일 경우 소폭 가산한다. 최대 1.5배로 제한.
-    이 임계값/가중치는 초기값이므로 실데이터로 TOP5/TOP10 분포를 보며 조정 권장.
     """
     bonus = 1.0
     if intent_word:
@@ -586,7 +578,6 @@ def _compute_opportunity_score(search_volume, doc_count, anchor, intent_word, ke
     """
     OpportunityScore = "검색량은 있는데 경쟁(문서수)은 적은" 키워드에 높은 점수.
 
-    [v19]
     - doc_count가 None이면 계산하지 않고 None을 반환한다.
     - 문서수 절대값 페널티 / 범용 상시 키워드(앵커) 페널티 / 브랜드·기관명
       페널티는 서로 곱하지 않고, 셋 중 가장 강한(작은) 배수 하나만 적용한다.
@@ -618,9 +609,8 @@ def _compute_opportunity_score(search_volume, doc_count, anchor, intent_word, ke
 
 def _compute_efficiency_score(search_volume, doc_count):
     """
-    [v19 신규] EfficiencyScore = log10(효율+1) 기반 0~10 스케일 점수.
+    EfficiencyScore = log10(효율+1) 기반 0~10 스케일 점수.
     효율 = 검색량 / 문서수. doc_count가 None이면 계산하지 않고 None 반환.
-    (FinalScore 계산 시에는 호출부에서 EFFICIENCY_NEUTRAL_FOR_UNKNOWN_DOC 대체)
     """
     if doc_count is None:
         return None
@@ -630,20 +620,14 @@ def _compute_efficiency_score(search_volume, doc_count):
 
 
 def _compute_category_score(category_weight):
-    """
-    category_weight(배수, 대략 0.5~2.0 범위 가정)를 0~10 스케일로 환산.
-    실제 profit_categories.json의 weight 분포를 보고 계수(5.0)는 조정이 필요할 수 있다.
-    """
+    """category_weight(배수)를 0~10 스케일로 환산."""
     weight = category_weight if category_weight is not None else 1.0
     score = weight * 5.0
     return round(max(0.0, min(score, 10.0)), 2)
 
 
 def _compute_datalab_score(datalab_ratio):
-    """
-    datalab_ratio(비율, 실패/미조회 시 중립값 1.0)를 0~10 스케일로 환산.
-    DATALAB_HARD_CUT(1.3)이 대략 6.5점이 되도록 계수(5.0)를 설정했다.
-    """
+    """datalab_ratio(비율)를 0~10 스케일로 환산."""
     ratio = datalab_ratio if datalab_ratio is not None else DATALAB_NEUTRAL_RATIO
     score = ratio * 5.0
     return round(max(0.0, min(score, 10.0)), 2)
@@ -761,7 +745,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
     expanded = _expand_related_keywords(survived_v, ads_api, tracker, log, max_workers)
     pool = _merge_pools(survived_v, expanded)
 
-    # ---- 3단계: 문서수 확인 (상위 50건만 실제 호출) ----
+    # ---- 3단계: 문서수 확인 (v19.1: 상위 150건만 실제 호출) ----
     doc_targets, doc_skip = _select_doc_check_targets(pool, DOC_COUNT_CHECK_LIMIT)
     _check_doc_counts(doc_targets, search_api, tracker, cache, log, DOC_MAX_WORKERS)
     for c in doc_skip:
@@ -820,14 +804,11 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         entry["datalab_score"] = _compute_datalab_score(entry.get("datalab_ratio"))
         entry["efficiency"] = _compute_efficiency(entry["search_volume"], entry.get("doc_count"))
 
-        # 브랜드/기관명 감점이 실제로 적용됐는지 표시(hold_reasons/reason_tags용)
         entry["_brand_penalty_applied"] = (
             _brand_institution_penalty_multiplier(entry.get("keyword", "")) < 1.0
             and entry.get("doc_count") is not None
         )
 
-        # [v19] FinalScore = Opportunity*0.45 + Efficiency*0.25 + Category*0.15
-        #                    + Issue*0.10 + DataLab*0.05
         opp_for_final = (
             entry["opportunity_score"]
             if entry["opportunity_score"] is not None
@@ -878,7 +859,6 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         remaining.append(entry)
 
     # ---- 등급 분류 2차: 위험 제외 후보 중 final_score 순으로 TOP5/TOP10 채우기 ----
-    # [v19] 검색량 300 미만은 TOP5 제외, 검색량 100 미만은 TOP10에서도 제외(무조건 보류).
     remaining.sort(key=lambda e: -e["final_score"])
 
     top5_list = []
@@ -897,7 +877,6 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         entry["grade"] = "TOP5"
         finalized.append(entry)
 
-    # TOP10 후보는 검색량 100 이상만 대상으로 하고, 100 미만은 순위와 무관하게 즉시 보류.
     top10_eligible = []
     top10_ineligible = []
     for entry in rest_pool:
@@ -928,7 +907,7 @@ def score_candidates(candidates, apis, log=None, max_workers=MAX_WORKERS):
         entry["rank"] = rank
         entry["reason_tags"] = _build_reason_tags(entry)
         entry.pop("sample_titles", None)
-        entry.pop("_brand_penalty_applied", None)  # 내부 임시 플래그는 최종 결과에서 제거
+        entry.pop("_brand_penalty_applied", None)
 
     api_health = tracker.summarize()
 
