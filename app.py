@@ -1,7 +1,24 @@
 # -*- coding: utf-8 -*-
 """
-app.py (v20.1)
+app.py (v20.2)
 네이버 블로그 수익형 키워드 발굴 시스템 - 대시보드형 UI
+
+[v20.2 변경 사항 - 보안/경로 정리 (config.json 격리 후속 조치, 최소 수정)]
+  1) BASE_DIR 계산 방식을 sys.argv[0] 기반에서 sys.frozen / sys.executable
+     명시적 분기로 변경. PyInstaller 빌드 환경에서 실행 파일 위치를 더
+     견고하게 판별하기 위함. (이전: os.path.dirname(os.path.abspath(sys.argv[0])))
+  2) load_config()가 손상된 config.json을 만났을 때 예외를 조용히 삼키지
+     않고, (cfg, error_message) 튜플을 반환하도록 변경. 호출부인
+     App.__init__()에서 오류가 있으면 messagebox 경고와 로그로 사용자에게
+     알린다(기본값으로 계속 실행은 되지만, 원인을 알 수 없는 설정 소실을
+     방지).
+  3) App._on_analysis_done()에서 save_config(self.cfg) 반환값을 확인해
+     실패 시 로그와 상태바 메시지로 안내하도록 변경(기존에는 반환값을
+     무시했음).
+  4) SettingsDialog의 ads_license_key 입력 필드에 secret=True를 추가해
+     화면에 마스킹 표시되도록 변경(기존에는 평문 노출).
+  위 네 가지 외의 UI 구조, 파이프라인 호출 순서, API 연동 로직, 점수/등급
+  분류 관련 코드는 전혀 변경하지 않았다.
 
 [v20.1 변경 사항 - 효율(efficiency) 표시 버그 수정 (최소 수정)]
   문서수(doc_count)를 확인하지 못한 보류 키워드의 경우, 기존에는 효율 컬럼에
@@ -63,9 +80,20 @@ from naver_search_api import (
 )
 
 APP_TITLE = "오늘의 수익형 키워드 발굴기"
-APP_VERSION = "v20.1"
+APP_VERSION = "v20.2"
 
-BASE_DIR = os.path.dirname(os.path.abspath(sys.argv[0]))
+# [v20.2] PyInstaller 빌드 환경에서 실행 파일 위치를 더 견고하게 판별하기
+# 위해 sys.frozen 여부를 명시적으로 분기한다.
+#   - PyInstaller로 빌드된 EXE로 실행된 경우: sys.frozen == True,
+#     이때는 sys.executable이 실제 EXE 파일의 경로를 가리킨다.
+#   - python app.py로 직접 실행된 경우: sys.frozen 속성 자체가 없으므로
+#     getattr(..., False)가 False를 반환하고, 이 스크립트 파일(__file__)
+#     기준으로 경로를 계산한다.
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
 CONFIG_FILE = os.path.join(BASE_DIR, "config.json")
 LOG_FILE = os.path.join(BASE_DIR, "trend_debug_log.txt")
 
@@ -98,15 +126,31 @@ DEFAULT_CONFIG = {
 
 
 def load_config():
+    """
+    config.json을 읽어 DEFAULT_CONFIG와 병합한 dict를 반환한다.
+
+    [v20.2 변경] 기존에는 JSON 파싱 실패 등 예외 발생 시 원인을 완전히
+    삼키고(except Exception: pass) 조용히 기본값으로 대체했다. 이 경우
+    사용자가 예전에 입력한 API 키가 사라져도 원인을 알 수 없는 문제가
+    있었다. 이제는 (cfg, error_message) 튜플을 반환하며, 파일이 없거나
+    정상적으로 읽힌 경우 error_message는 None이다. 오류가 있어도 cfg는
+    항상 DEFAULT_CONFIG 기반의 유효한 값으로 채워지므로, 이 함수를 호출한
+    쪽에서 오류 유무만 확인해 안내하면 된다(파이프라인 자체는 계속 진행).
+
+    Returns
+    -------
+    (cfg, error_message) : tuple[dict, str | None]
+    """
     cfg = dict(DEFAULT_CONFIG)
+    error_message = None
     if os.path.exists(CONFIG_FILE):
         try:
             with open(CONFIG_FILE, "r", encoding="utf-8") as f:
                 saved = json.load(f)
             cfg.update(saved)
-        except Exception:
-            pass
-    return cfg
+        except Exception as e:
+            error_message = str(e)
+    return cfg, error_message
 
 
 def save_config(cfg):
@@ -159,7 +203,9 @@ class SettingsDialog(tk.Toplevel):
         ttk.Label(tab2, text="searchad.naver.com 별도 인증 정보 (Customer ID / License Key / Secret Key)",
                   foreground="#777777").grid(row=0, column=0, columnspan=2, sticky="w", pady=(0, 10))
         self._field(tab2, "Customer ID", "ads_customer_id", 1)
-        self._field(tab2, "License Key(엑세스라이선스)", "ads_license_key", 2)
+        # [v20.2 변경] License Key도 시크릿 키와 함께 서명 생성에 쓰이는 인증
+        # 정보이므로, 화면 노출 방지를 위해 secret=True로 마스킹 처리한다.
+        self._field(tab2, "License Key(엑세스라이선스)", "ads_license_key", 2, secret=True)
         self._field(tab2, "Secret Key(비밀키)", "ads_secret_key", 3, secret=True)
         ttk.Button(tab2, text="검색광고 API 테스트", command=self._test_ads).grid(row=4, column=0, pady=10, sticky="w")
         self.status2 = ttk.Label(tab2, text="", foreground="#555555")
@@ -531,7 +577,10 @@ class App(tk.Tk):
         self.geometry("1420x900")
         self.minsize(1180, 720)
 
-        self.cfg = load_config()
+        # [v20.2] load_config()가 (cfg, error_message) 튜플을 반환하도록
+        # 변경되었으므로 이를 받아 처리한다. cfg_load_error가 있으면
+        # UI가 모두 구성된 뒤(로그/상태바 사용 가능 시점)에 사용자에게 알린다.
+        self.cfg, self._cfg_load_error = load_config()
         self.results = []
         self.log_window = None
         self.queue = queue.Queue()
@@ -546,6 +595,18 @@ class App(tk.Tk):
         self._build_writing_panel()
         self._build_status_bar()  # 반드시 다른 위젯들보다 나중에 pack (맨 아래 위치)
         self._poll_queue()
+
+        # [v20.2 신규] config.json이 손상되어 기본값으로 대체된 경우, 조용히
+        # 넘어가지 않고 로그와 경고창으로 사용자에게 알린다. 이미 UI가 모두
+        # 구성된 뒤라 self._log()와 messagebox 모두 정상적으로 사용 가능하다.
+        if self._cfg_load_error:
+            self._log(f"[app] 경고: config.json 로드 실패 - 기본값으로 시작합니다: {self._cfg_load_error}")
+            messagebox.showwarning(
+                "설정 파일 오류",
+                "config.json 파일을 읽는 중 오류가 발생하여 기본값으로 시작합니다.\n\n"
+                f"오류 내용: {self._cfg_load_error}\n\n"
+                "메뉴의 '설정 > API 설정'에서 API 키를 다시 입력하고 저장해 주세요."
+            )
 
     # ---------------------------------------------------------------
     def _build_menu(self):
@@ -880,7 +941,15 @@ class App(tk.Tk):
         self.results = payload["results"]
         self.cfg["api_status"] = payload["api_health"]
         self.cfg["last_run"] = datetime.now().strftime("%m-%d %H:%M")
-        save_config(self.cfg)
+
+        # [v20.2 변경] save_config()의 반환값을 확인하지 않던 기존 코드를
+        # 수정. 저장 실패 시(예: 쓰기 권한 문제, 디스크 오류) 조용히
+        # 넘어가지 않고 로그와 상태바 메시지로 사용자에게 알린다. 분석
+        # 결과 자체(self.results)는 메모리에 남아있으므로 화면 표시에는
+        # 영향이 없다.
+        save_ok = save_config(self.cfg)
+        if not save_ok:
+            self._log("[app] 경고: 분석 결과 저장(config.json) 실패 - 폴더 쓰기 권한을 확인하세요.")
 
         counts = {g: 0 for g in GRADE_ORDER}
         for d in self.results:
@@ -896,7 +965,11 @@ class App(tk.Tk):
         self._refresh_summary_bar()
         self.detail_panel.clear()
         self.writing_panel.set_selected(None)
-        self._show_status("분석이 완료되었습니다.")
+
+        if save_ok:
+            self._show_status("분석이 완료되었습니다.")
+        else:
+            self._show_status("분석은 완료되었지만 설정 저장에 실패했습니다.")
 
     def _on_analysis_error(self, err):
         self.progress.stop()
