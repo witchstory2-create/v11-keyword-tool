@@ -1,9 +1,28 @@
 # -*- coding: utf-8 -*-
 """
-profit_filter.py (v18.7)
+profit_filter.py (v18.8)
 네이버 블로그 수익형 키워드 발굴 시스템 - 수익형 판별 전담 모듈 (역할 축소판)
 
-[v18.7 변경 사항 - 수익형 필터 강화]
+[v18.8 변경 사항 - 보안/경로 정리 (config.json 격리 작업 후속 조치, 최소 수정)]
+  _base_dir()의 경로 계산 방식을 sys.argv[0] 기반에서 app.py(v20.2),
+  scorer.py(v19.7.1)와 동일한 sys.frozen / sys.executable 명시적 분기로
+  변경했다. (이전: os.path.dirname(os.path.abspath(sys.argv[0])))
+
+  기존 sys.argv[0] 기반 계산은 대부분의 PyInstaller onefile 빌드 환경에서는
+  sys.executable과 실질적으로 같은 값을 가리키지만, 실행 방식에 따라
+  sys.argv[0]이 상대경로이거나 예상과 다른 값을 가질 수 있어 config.json /
+  keyword_history.json과 profit_categories.json이 서로 다른 폴더에 생성될
+  이론적 위험이 있었다. 이번 변경으로 세 파일(config.json, keyword_history.json,
+  profit_categories.json) 모두 EXE 옆 동일한 폴더를 기준으로 생성되도록
+  통일된다.
+
+  이 변경 외의 CONFIG_FILENAME, load_profit_config()의 병합 로직
+  (categories/intent_words의 update 방식, exclude_keywords의 합집합 병합
+  방식), _default_config()가 반환하는 카테고리/의도어/제외 키워드 기본값,
+  _compute_intent_score(), _is_excluded(), filter_candidates()의 로직과
+  반환 필드는 v18.7과 완전히 동일하다.
+
+[이하 v18.7 변경 사항 - 수익형 필터 강화, 변경 없음 - 참고용으로 유지]
 1) intent_words 기본값에 "환급", "지원", "가입", "금리", "청구"를 추가했다.
    기존에는 이 5개 단어가 목록에 없어 기본값 0.3점만 받아 실제로는 수익형
    의도가 뚜렷한 키워드가 낮은 점수를 받는 문제가 있었다.
@@ -48,7 +67,21 @@ import json
 # 0. 경로 / 설정 파일 처리
 # =========================================================================
 def _base_dir():
-    return os.path.dirname(os.path.abspath(sys.argv[0]))
+    """
+    [v18.8] PyInstaller 빌드 환경에서 실행 파일 위치를 더 견고하게 판별하기
+    위해 sys.frozen 여부를 명시적으로 분기한다. app.py(v20.2), scorer.py
+    (v19.7.1)의 BASE_DIR 계산 방식과 동일한 패턴이다.
+
+      - PyInstaller로 빌드된 EXE로 실행된 경우: sys.frozen == True,
+        이때는 sys.executable이 실제 EXE 파일의 경로를 가리킨다.
+      - python profit_filter.py로 직접 실행되거나 다른 모듈에서 import되어
+        실행되는 경우: sys.frozen 속성 자체가 없으므로 getattr(..., False)가
+        False를 반환하고, 이 스크립트 파일(__file__) 기준으로 경로를
+        계산한다.
+    """
+    if getattr(sys, "frozen", False):
+        return os.path.dirname(os.path.abspath(sys.executable))
+    return os.path.dirname(os.path.abspath(__file__))
 
 
 CONFIG_FILENAME = "profit_categories.json"
@@ -137,9 +170,12 @@ def load_profit_config(path=None, log=None):
     """
     profit_categories.json을 로드. 없으면 기본값으로 새로 생성.
 
-    [v18.7 변경] exclude_keywords 병합 방식을 "통째로 교체"에서
+    [v18.7] exclude_keywords 병합 방식을 "통째로 교체"에서
     "합집합(중복 제거)"으로 변경. categories/intent_words는 기존과 동일하게
     부분 업데이트(딕셔너리 update) 방식을 유지한다.
+
+    [v18.8] path 계산에 사용되는 _base_dir()의 내부 로직만 sys.frozen 기준으로
+    바뀌었을 뿐, 이 함수 자체의 병합 로직은 전혀 변경하지 않았다.
     """
     path = path or os.path.join(_base_dir(), CONFIG_FILENAME)
     default = _default_config()
@@ -238,6 +274,9 @@ def filter_candidates(candidates, category_config_path=None, log=None):
     """
     [v18.7] 함수 시그니처와 반환 필드는 v18.6과 완전히 동일하다.
     로그에 입력 후보 수를 추가로 남겨 파이프라인 단계별 추적이 쉬워졌다.
+
+    [v18.8] _base_dir() 내부 계산 방식만 변경되었을 뿐, 이 함수의 로직은
+    전혀 변경하지 않았다.
     """
     cfg = load_profit_config(category_config_path, log=log)
     category_cfg = cfg["categories"]
