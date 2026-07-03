@@ -1,1 +1,8 @@
 config.json
+keyword_history.json
+keyword_tree.json
+trend_debug_log.txt
+build/
+dist/
+__pycache__/
+*.pyc
