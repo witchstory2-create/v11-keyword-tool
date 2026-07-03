@@ -175,7 +175,9 @@ RELATED_L2_MAX_WORKERS = 2          # max_workers 1~2 유지
 MIN_KEYWORD_LENGTH_FOR_ADS = 2      # 정리 후 길이가 이보다 짧으면 호출하지 않음(운영 중 튜닝 가능)
 MAX_KEYWORD_LENGTH_FOR_ADS = 40     # 정리 후 길이가 이보다 길면 호출하지 않음(운영 중 튜닝 가능)
 
-DOC_COUNT_CHECK_LIMIT = 150      # 문서수 조회는 검색량×의도점수 상위 150건까지만 실제 호출 (v19.1)
+DOC_COUNT_CHECK_LIMIT = 250      # 문서수 조회는 2버킷(A:180+B:70) 방식으로 최대 250건까지만 실제 호출
+DOC_COUNT_BUCKET_A_SIZE = 180    # 버킷 A: 검색량×의도점수 상위 180건
+DOC_COUNT_BUCKET_B_SIZE = 70     # 버킷 B: 버킷 A를 제외한 나머지 중 카테고리별로 고르게 분배한 70건
 DATALAB_CHECK_LIMIT = 25         # DataLab 조회는 문서수 확인된 후보 중 효율 상위 25건까지만 실제 호출
 DOC_MAX_WORKERS = 2              # 문서수 조회 병렬 수 (429 방지)
 DATALAB_MAX_WORKERS = 1          # DataLab 조회는 순차 처리 (timeout 방지)
@@ -913,11 +915,53 @@ def _expand_related_keywords_level2(expanded, ads_api, tracker, existing_keyword
 # 4. 3단계: 문서수 확인 (상위 150건 제한 / 배치 처리 + 429 조기중단)
 # =========================================================================
 def _select_doc_check_targets(pool, limit=DOC_COUNT_CHECK_LIMIT):
-    """검색량×의도점수 기준 상위 limit건만 실제 문서수 조회 대상으로 선정."""
+    """
+    문서수 조회 대상을 2버킷 방식으로 선정한다.
+
+    버킷 A: 검색량×의도점수 기준 전체 정렬 상위 DOC_COUNT_BUCKET_A_SIZE(180)건.
+    버킷 B: 버킷 A에 포함되지 못한 나머지 후보 중, 카테고리별로 라운드로빈
+            방식으로 고르게 순회하며 뽑은 DOC_COUNT_BUCKET_B_SIZE(70)건.
+            (각 카테고리 내부에서는 여전히 검색량×의도점수 순으로 우선 선택)
+
+    두 버킷을 합친 결과가 최종 문서수 조회 대상이며, limit(기본 250)을
+    넘지 않도록 마지막에 한 번 더 슬라이싱한다.
+    """
     ranked = sorted(
         pool, key=lambda c: -(c.get("search_volume", 0) * c.get("intent_score", 0.3))
     )
-    return ranked[:limit], ranked[limit:]
+
+    bucket_a = ranked[:DOC_COUNT_BUCKET_A_SIZE]
+    remainder = ranked[DOC_COUNT_BUCKET_A_SIZE:]
+
+    by_category = {}
+    for c in remainder:
+        by_category.setdefault(c.get("category", ""), []).append(c)
+    for cat in by_category:
+        by_category[cat].sort(
+            key=lambda c: -(c.get("search_volume", 0) * c.get("intent_score", 0.3))
+        )
+
+    categories = list(by_category.keys())
+    idx_by_cat = {cat: 0 for cat in categories}
+    bucket_b = []
+    while len(bucket_b) < DOC_COUNT_BUCKET_B_SIZE and categories:
+        progressed = False
+        for cat in categories:
+            if len(bucket_b) >= DOC_COUNT_BUCKET_B_SIZE:
+                break
+            i = idx_by_cat[cat]
+            if i < len(by_category[cat]):
+                bucket_b.append(by_category[cat][i])
+                idx_by_cat[cat] = i + 1
+                progressed = True
+        if not progressed:
+            break
+
+    selected = bucket_a + bucket_b
+    selected_ids = {id(c) for c in selected}
+    skipped = [c for c in ranked if id(c) not in selected_ids]
+
+    return selected[:limit], skipped
 
 
 def _fetch_doc_count_one(search_api, keyword, tracker, log, cache):
