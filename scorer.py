@@ -1,12 +1,31 @@
 # -*- coding: utf-8 -*-
 """
-scorer.py (v19.7)
+scorer.py (v19.7.1)
 네이버 블로그 수익형 키워드 발굴 시스템 - 검증/확장/점수화/등급분류 통합 엔진
 
 [파이프라인 내 위치]
   collector.collect_candidates() -> profit_filter.filter_candidates() -> scorer.score_candidates()
 
-[v19.7 변경 사항 - 2차 연관검색어 확장(Ads L2) 추가, 승인된 12개 조건만 반영]
+[v19.7.1 변경 사항 - keyword_history.json 경로 정리 (보안/경로 정리 작업, 최소 수정)]
+  기존 KEYWORD_HISTORY_FILE = "keyword_history.json"은 실행 위치(현재 작업
+  디렉토리, os.getcwd()) 기준 상대경로였다. 이 경우 사용자가 EXE를 바탕화면이
+  아닌 다른 위치(단축아이콘의 "시작 위치" 설정, cmd에서 다른 폴더로 이동 후
+  실행 등)에서 실행하면 keyword_history.json이 config.json과 다른 폴더에
+  생성될 수 있었다.
+
+  v19.7.1부터는 app.py의 BASE_DIR 계산 방식과 동일한 패턴(sys.frozen /
+  sys.executable 명시적 분기)을 scorer.py 자체적으로 적용해, 항상 실행
+  파일(EXE) 또는 스크립트가 위치한 폴더를 기준으로 한 절대경로를 사용한다.
+  KEYWORD_HISTORY_FILE을 사용하는 두 함수(_load_keyword_history,
+  _save_keyword_history)는 이미 path를 인자로 받는 구조라 내부 로직은
+  전혀 수정하지 않았고, 상수 값만 상대경로에서 절대경로로 바뀌었다.
+
+  이번 변경은 점수 계산, API 호출 순서, 429 대응 로직, 등급 분류에는
+  어떠한 영향도 주지 않는다. 아직 keyword_tree.json 관련 기능(KEYWORD_TREE_FILE
+  등)은 이 버전의 코드에 존재하지 않으므로 이번 변경 대상에 포함하지 않았다
+  (해당 기능이 실제로 추가되는 시점에 동일한 패턴으로 함께 처리할 예정).
+
+[이하 v19.7 변경 사항 - 2차 연관검색어 확장(Ads L2) 추가, 승인된 12개 조건만 반영]
 
   이번 버전은 1차 연관검색어 확장(기존 _expand_related_keywords, 변경 없음) 다음에
   "2차 연관검색어 확장" 한 단계만 추가했다. 429 대응 로직, 점수 계산, 등급 분류,
@@ -95,14 +114,16 @@ scorer.py (v19.7)
   - 신규 추가 필드(비파괴적 추가, v19.7): expansion_depth (int, 2차 확장
     유입 후보에만 존재. 그 외 후보는 이 키 자체가 없음 - .get()으로 안전하게
     조회할 것)
+  - v19.7.1: 신규 필드 없음(keyword_history.json 저장 경로만 변경)
 
-표준 라이브러리만 사용 (math, time, random, re, os, json, threading,
+표준 라이브러리만 사용 (math, time, random, re, os, sys, json, threading,
 datetime, concurrent.futures) -> PyInstaller / GitHub Actions 빌드 100%
 호환. 외부 pip 패키지 없음.
 """
 
 import re
 import os
+import sys
 import json
 import math
 import time
@@ -211,11 +232,25 @@ BRAND_LONGTAIL_MAX_BONUS = 1.5
 # ---- EfficiencyScore 스케일 계수 (v19와 동일) ----
 EFFICIENCY_LOG_SCALE = 5.0
 
-# ---- [v19.6 신규] keyword_history.json 저장/로드 기능 ----
+# [v19.7.1 신규] PyInstaller 빌드 환경에서 실행 파일 위치를 견고하게 판별하기
+# 위해 sys.frozen 여부를 명시적으로 분기한다. app.py의 BASE_DIR 계산 방식과
+# 동일한 패턴이다. scorer.py는 app.py 없이 단독 실행(__main__)도 가능한
+# 모듈이므로, app.py의 BASE_DIR 값을 가져다 쓰지 않고 이 파일 자체적으로
+# 계산해 모듈 간 결합도를 낮게 유지한다.
+if getattr(sys, "frozen", False):
+    BASE_DIR = os.path.dirname(os.path.abspath(sys.executable))
+else:
+    BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+
+# ---- [v19.6 신규, v19.7.1에서 경로만 변경] keyword_history.json 저장/로드 기능 ----
 # 이번 단계에서는 이 히스토리를 점수 계산이나 등급 분류에 전혀 사용하지 않는다.
 # 순수하게 "다음 실행 때 참고할 데이터를 쌓아두는" 뼈대만 추가한 것이다.
 ENABLE_KEYWORD_HISTORY = True        # False로 바꾸면 히스토리 기능 전체를 끌 수 있음 (v19.5와 100% 동일 동작)
-KEYWORD_HISTORY_FILE = "keyword_history.json"  # 실행 위치 기준 상대경로
+# [v19.7.1 변경] 상대경로("keyword_history.json") -> BASE_DIR 기준 절대경로.
+# 실행 위치(현재 작업 디렉토리)에 따라 config.json과 다른 폴더에 생성되던
+# 문제를 방지한다. _load_keyword_history()/_save_keyword_history()는 이미
+# path를 인자로 받으므로 내부 로직은 변경하지 않았다.
+KEYWORD_HISTORY_FILE = os.path.join(BASE_DIR, "keyword_history.json")
 KEYWORD_HISTORY_RETENTION_DAYS = 30  # 이 기간을 넘는 기록은 자동 정리(prune)
 KEYWORD_HISTORY_TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
 
@@ -348,8 +383,8 @@ def _sanitize_keyword_for_ads(raw_keyword):
     get_related_keywords) 호출 자체를 시도하지 않는다. 호출 실패(429 등)와는
     원인이 다르므로 volume_invalid_keyword로 별도 표시한다.
 
-    [v19.6, v19.7] 이번 버전에서도 이 함수의 동작은 변경하지 않았다
-    (승인된 범위 밖).
+    [v19.6, v19.7, v19.7.1] 이번 버전에서도 이 함수의 동작은 변경하지
+    않았다(승인된 범위 밖).
 
     Returns
     -------
