@@ -368,7 +368,7 @@ class _KeywordCache:
 # =========================================================================
 # 1B. [v19.5] ads API(hintKeywords) 400 방지를 위한 키워드 유효성 검사
 # =========================================================================
-_KEYWORD_ALLOWED_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9 ]+$")
+_KEYWORD_ALLOWED_PATTERN = re.compile(r"^[가-힣a-zA-Z0-9]+$")
 
 
 def _sanitize_keyword_for_ads(raw_keyword):
@@ -394,7 +394,7 @@ def _sanitize_keyword_for_ads(raw_keyword):
     """
     if not raw_keyword:
         return "", False
-    cleaned = re.sub(r"\s+", " ", raw_keyword.strip())
+    cleaned = re.sub(r"\s+", "", raw_keyword.strip())
     if not cleaned:
         return cleaned, False
     if not _KEYWORD_ALLOWED_PATTERN.match(cleaned):
