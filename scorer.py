@@ -175,9 +175,9 @@ RELATED_L2_MAX_WORKERS = 2          # max_workers 1~2 유지
 MIN_KEYWORD_LENGTH_FOR_ADS = 2      # 정리 후 길이가 이보다 짧으면 호출하지 않음(운영 중 튜닝 가능)
 MAX_KEYWORD_LENGTH_FOR_ADS = 40     # 정리 후 길이가 이보다 길면 호출하지 않음(운영 중 튜닝 가능)
 
-DOC_COUNT_CHECK_LIMIT = 250      # 문서수 조회는 2버킷(A:180+B:70) 방식으로 최대 250건까지만 실제 호출
-DOC_COUNT_BUCKET_A_SIZE = 180    # 버킷 A: 검색량×의도점수 상위 180건
-DOC_COUNT_BUCKET_B_SIZE = 70     # 버킷 B: 버킷 A를 제외한 나머지 중 카테고리별로 고르게 분배한 70건
+DOC_COUNT_CHECK_LIMIT = 350      # 문서수 조회는 2버킷(A:250+B:100) 방식으로 최대 350건까지만 실제 호출
+DOC_COUNT_BUCKET_A_SIZE = 250    # 버킷 A: 검색량×의도점수 상위 250건
+DOC_COUNT_BUCKET_B_SIZE = 100    # 버킷 B: 버킷 A를 제외한 나머지 중 카테고리별로 고르게 분배한 100건
 DATALAB_CHECK_LIMIT = 25         # DataLab 조회는 문서수 확인된 후보 중 효율 상위 25건까지만 실제 호출
 DOC_MAX_WORKERS = 2              # 문서수 조회 병렬 수 (429 방지)
 DATALAB_MAX_WORKERS = 1          # DataLab 조회는 순차 처리 (timeout 방지)
