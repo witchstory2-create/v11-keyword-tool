@@ -49,6 +49,16 @@ app.py (v20.2)
    분석 시작 전 429/timeout 집계를 초기화하고, 분석 종료 후 로그에 발생
    횟수를 출력한다.
 
+[v20.3 변경 사항 - History Penalty 반영 정렬 (최소 수정)]
+  scorer.py v19.8이 adjusted_final_score / history_penalty_hits /
+  history_penalty_rate 필드를 반환하기 시작함에 따라, _render_table()에서
+  TOP5/TOP10 그룹만 adjusted_final_score 기준으로 정렬하도록 수정했다.
+  adjusted_final_score 필드가 없는 경우(예: 구버전 scorer.py 결과)에는
+  final_score로 자동 fallback한다. 보류/위험 그룹은 기존과 동일하게
+  final_score 기준 정렬을 유지한다. 이 변경은 _render_table() 내부의
+  정렬 한 줄에만 적용되며, 그 외 그룹 구성, 트리 삽입, 상세 패널, CSV
+  내보내기, 설정창, 로그, 콘텐츠 생성 기능은 전혀 변경하지 않았다.
+
 파이프라인:
   collector.collect_candidates()   -> 후보 수집
   profit_filter.filter_candidates()-> 수익형 필터링(카테고리 가중치/검색의도)
@@ -990,7 +1000,18 @@ class App(tk.Tk):
                 grouped[g].append(d)
 
         for g in GRADE_ORDER:
-            items = sorted(grouped[g], key=lambda d: -(d.get("final_score", 0)))
+            # [v20.3] TOP5/TOP10 그룹만 adjusted_final_score 기준으로 정렬한다.
+            # scorer.py v19.8부터 History Penalty가 적용된 adjusted_final_score를
+            # 반환하며, 이 필드가 없는 경우(구버전 결과 등)에는 final_score로
+            # 자동 fallback한다. 보류/위험 그룹은 기존과 동일하게 final_score
+            # 기준 정렬을 유지한다(등급 판정에는 영향이 없어야 하므로).
+            if g in ("TOP5", "TOP10"):
+                items = sorted(
+                    grouped[g],
+                    key=lambda d: -(d.get("adjusted_final_score", d.get("final_score", 0)))
+                )
+            else:
+                items = sorted(grouped[g], key=lambda d: -(d.get("final_score", 0)))
             group_id = self.tree.insert(
                 "", "end", text=f"{g} ({len(items)})",
                 open=(g in ("TOP5", "TOP10")), tags=(f"group_{g}",)
