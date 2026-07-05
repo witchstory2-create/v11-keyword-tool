@@ -1,3 +1,25 @@
+# scorer.py 최상단에 추가
+
+def _to_text(x):
+    """list/None 등 예상치 못한 타입을 안전하게 문자열로 정규화"""
+    if x is None:
+        return ""
+    if isinstance(x, list):
+        return " ".join(str(i) for i in x if i is not None)
+    return str(x)
+
+
+def analyze_news(news_title, news_summary):
+    news_title = _to_text(news_title)
+    news_summary = _to_text(news_summary)
+
+    text = news_title + " " + news_summary
+
+    # ↓↓↓ 이하 기존 로직 그대로 유지 (수정 없음) ↓↓↓
+    ...
+
+
+
 import re
 from collections import Counter
 
