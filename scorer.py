@@ -1,16 +1,12 @@
 # scorer.py
-# 뉴스 분석 + 전략 판단 + 제목 생성 (v6 통합 / GUI 호환)
-# 외부 라이브러리 의존 없음 (표준 라이브러리만 사용)
-
 import re
 from collections import Counter
 
 # ------------------------------------------------------------
-# 0. 안전 유틸 (모든 타입 불일치 방어 지점)
+# 0. 안전 유틸
 # ------------------------------------------------------------
 
 def _to_text(x):
-    """list/tuple/None 등 어떤 타입이 와도 안전한 문자열로 정규화"""
     if x is None:
         return ""
     if isinstance(x, (list, tuple)):
@@ -21,7 +17,6 @@ def _to_text(x):
 
 
 def _join(parts, sep=" "):
-    """리스트를 문자열로 합칠 때는 무조건 이 함수만 사용 (+ 연산 금지)"""
     return sep.join(_to_text(p) for p in parts if p is not None and _to_text(p) != "")
 
 
@@ -97,7 +92,6 @@ def build_event(main_keyword, action_intents, text):
 
 
 def extract_detail(text):
-    """나이/기한/날짜/금액 등 구체 정보 추출"""
     text = _to_text(text)
     patterns = [
         r"\d+세", r"\d+월\s?\d+일", r"\d+월말", r"\d+만원", r"\d+억원",
@@ -111,7 +105,7 @@ def extract_detail(text):
 
 
 # ------------------------------------------------------------
-# 2. 전략 판단 (검색형 / 홈판형 / 혼합형)
+# 2. 전략 판단
 # ------------------------------------------------------------
 
 def judge_strategy(text):
@@ -162,7 +156,6 @@ def generate_questions(main_keyword, action_intents, detail, related_keywords):
     if related_keywords:
         questions.append(f"{main_keyword}와 {related_keywords[0]}의 차이는 무엇인가요?")
 
-    # 최소 3개, 최대 5개로 보정
     if len(questions) < 3:
         questions.append(f"{main_keyword} 관련 주의할 점은 무엇인가요?")
 
@@ -182,7 +175,6 @@ def generate_outline(main_keyword, action_intents, questions):
 
     outline.append("마무리 및 유의사항")
 
-    # 중복 제거하면서 순서 유지
     seen = set()
     deduped = []
     for item in outline:
@@ -193,7 +185,7 @@ def generate_outline(main_keyword, action_intents, questions):
 
 
 # ------------------------------------------------------------
-# 4. 제목 생성 (검색형 / 클릭베이트 / 혼합형 각 5개)
+# 4. 제목 생성
 # ------------------------------------------------------------
 
 def generate_titles(main_keyword, related_keywords, action_intents, detail, event, strategy):
@@ -233,15 +225,14 @@ def generate_titles(main_keyword, related_keywords, action_intents, detail, even
 
 
 # ------------------------------------------------------------
-# 5. 핵심 함수: analyze_news (반환 구조 고정)
+# 5. 핵심 함수: analyze_news
 # ------------------------------------------------------------
 
 def analyze_news(news_title, news_summary):
-    # --- 입력 정규화 (타입 방어 1차 지점) ---
     news_title = _to_text(news_title)
     news_summary = _to_text(news_summary)
 
-    text = _join([news_title, news_summary])  # "+" 대신 안전한 join만 사용
+    text = _join([news_title, news_summary])
 
     keywords = extract_keywords(news_title, news_summary)
     main_keyword, related_keywords = split_main_related(keywords)
@@ -274,12 +265,12 @@ def analyze_news(news_title, news_summary):
 
 # ------------------------------------------------------------
 # 6. GUI 호환 wrapper: score_candidates
-#    - GUI가 어떤 인자를 넘기든 TypeError 없이 흡수
-#    - candidates: list[dict] 형태 (title/summary 필드가 str이든 list든 안전 처리)
+#    - candidates 뒤에 오는 모든 위치 인자는 *args가 흡수
+#    - log/progress_callback은 키워드 전용 인자로 고정
+#      -> "multiple values for argument 'log'" 충돌 원천 차단
 # ------------------------------------------------------------
 
 def _extract_title_summary(candidate):
-    """candidate dict에서 title/summary를 안전하게 뽑아 문자열로 정규화"""
     if isinstance(candidate, dict):
         title = candidate.get("title") or candidate.get("news_title") or ""
         summary = (
@@ -289,21 +280,13 @@ def _extract_title_summary(candidate):
             or ""
         )
     else:
-        # candidate가 (title, summary) 튜플 등으로 오는 경우 방어
         title = candidate[0] if len(candidate) > 0 else ""
         summary = candidate[1] if len(candidate) > 1 else ""
 
     return _to_text(title), _to_text(summary)
 
 
-def score_candidates(candidates=None, log=None, progress_callback=None, *args, **kwargs):
-    """
-    GUI(app.py)가 어떤 방식으로 호출해도 TypeError 없이 동작하도록
-    *args, **kwargs로 모든 추가 인자를 흡수.
-    candidates: list[dict] (필수, 각 dict는 title/summary 포함)
-    log: 콜러블(로그 함수) 또는 None
-    progress_callback: 콜러블(진행률 함수) 또는 None
-    """
+def score_candidates(candidates=None, *args, log=None, progress_callback=None, **kwargs):
     def _log(msg):
         if callable(log):
             try:
@@ -330,7 +313,6 @@ def score_candidates(candidates=None, log=None, progress_callback=None, *args, *
         try:
             result = analyze_news(title, summary)
         except Exception as e:
-            # 개별 후보 실패가 전체 배치를 죽이지 않도록 격리
             _log(f"[score_candidates] {idx}/{total} 분석 실패: {e}")
             result = {
                 "analysis": {
