@@ -328,3 +328,6 @@ if __name__ == "__main__":
         "지원 기간은 오는 8월 말까지다."
     )
     print(json.dumps(analyze_news(sample_title, sample_summary), ensure_ascii=False, indent=2))
+
+def score_candidates(news_title, news_summary):
+    return analyze_news(news_title, news_summary)
