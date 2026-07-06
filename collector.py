@@ -1,42 +1,32 @@
 # -*- coding: utf-8 -*-
 """
-collector.py (v18.6)
+collector.py (v18.7)
 네이버 블로그 수익형 키워드 발굴 시스템 - 후보 수집/정제 전담 모듈
 
+[v18.7 변경 사항 - articles 필드 추가]
+후보 dict에 articles=[{title, url, snippet, date}, ...] 필드를 추가하여
+기사 원문 메타데이터를 파이프라인 전체(profit_filter -> scorer -> app)로
+전달한다. URL 기준 중복 제거, 후보당 최대 5건 보존. 기존 필드는 전혀
+제거/변경하지 않았다(순수 additive patch).
+
 [v18.6 변경 사항 - 정치/국제/연예/스포츠/학교 맥락 오프토픽 기사 제외]
-기존 노이즈 블랙리스트(언론사명, 지역명, 날짜, 인물호칭, 영어잔재어)는 개별
-"토큰" 단위로 걸러냈지만, 앵커(예: "지원금", "보험") 자체는 정치/연예 기사에서도
-언급될 수 있어 이 방식만으로는 걸러지지 않았다. 예를 들어 "여당이 재난지원금
-지급안을 발표했다"라는 정치 기사에서도 앵커 "지원금"이 그대로 매칭되어
-시사성 키워드가 후보로 섞여 들어오는 문제가 있었다.
-
-v18.6부터는 기사 단위로 OFFTOPIC_CONTEXT_WORDS(정치/국제/연예/스포츠/학교
-맥락어)가 함께 등장하는지 먼저 확인하고, 하나라도 발견되면 그 기사에서는
-후보를 전혀 추출하지 않는다(기사 자체를 건너뜀). 정상적인 수익형 기사 처리
-로직, 출력 계약(필드명), 앵커/의도어 정의, 병렬 처리 구조는 전혀 변경하지
-않았다.
-
-[역할]
-  - 무작위 뉴스 수집이 아니라, 수익형 카테고리별 시드 쿼리로만 네이버 뉴스를 조회.
-  - HTML 엔티티, 언론사명, 날짜, 지역명, 인물 호칭 등 일반 뉴스 노이즈를 원천 차단.
-  - [v18.6 신규] 정치/국제/연예/스포츠/학교 맥락이 섞인 기사는 후보 추출 대상에서 제외.
-  - 카테고리 앵커(anchor) + 검색의도어(intent word) 조합으로 후보 키워드를 생성.
-  - 수익성 판단(profit_filter)이나 점수화(scorer)는 이 파일의 책임이 아님.
-    여기서는 "깨끗하고 카테고리가 명확한 후보"만 만들어서 넘긴다.
+기사 단위로 OFFTOPIC_CONTEXT_WORDS가 함께 등장하면 그 기사에서는 후보를
+전혀 추출하지 않는다. 정상 처리 로직, 앵커/의도어 정의, 병렬 처리 구조는
+전혀 변경하지 않았다.
 
 [출력 계약] collect_candidates()가 반환하는 리스트의 각 원소(dict)는
-  아래 필드를 반드시 포함한다. 이후 모든 다운스트림 모듈은 이 필드명을 그대로 사용한다.
-  (v18.5와 완전히 동일 - 변경 없음)
+아래 필드를 포함한다.
 
     {
-        "keyword"       : str
-        "category"      : str
-        "anchor"        : str
-        "intent_word"   : str|None
-        "mentions"      : int
-        "sample_titles" : list[str]
-        "seed_query"    : str
-        "first_pub_date": str
+        "keyword"        : str
+        "category"       : str
+        "anchor"         : str
+        "intent_word"    : str|None
+        "mentions"       : int
+        "sample_titles"  : list[str]
+        "articles"       : list[{"title","url","snippet","date"}]  # v18.7 신규
+        "seed_query"     : str
+        "first_pub_date" : str
         "latest_pub_date": str
     }
 
@@ -50,6 +40,20 @@ import time
 import random
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
+# =========================================================================
+# [v18.7] 진단 로그 헬퍼 - log 콜백 우선 사용, 없으면 print 폴백
+# =========================================================================
+def _diag_log(msg, log=None, log_callback=None):
+    fn = log or log_callback
+    if callable(fn):
+        try:
+            fn(msg)
+            return
+        except Exception:
+            pass
+    print(msg)
 
 
 # =========================================================================
@@ -171,12 +175,7 @@ PARTICLE_SUFFIXES = [
 ]
 
 # =========================================================================
-# [v18.6 신규] 정치/국제/연예/스포츠/학교 맥락어
-# -------------------------------------------------------------------------
-# 앵커 자체는 매칭되지만, 기사 전체 맥락이 아래 카테고리에 해당하면
-# 수익형 정보 검색 의도가 아닌 시사성/화제성 기사로 판단해 후보 추출을
-# 아예 건너뛴다. 필요 시 이 목록만 추가/조정하면 되고, 다른 로직은
-# 변경할 필요가 없다.
+# [v18.6] 정치/국제/연예/스포츠/학교 맥락어
 # =========================================================================
 OFFTOPIC_CONTEXT_WORDS = {
     "정치": [
@@ -283,15 +282,7 @@ def _tokenize(cleaned_title):
     return tokens
 
 
-# =========================================================================
-# [v18.6 신규] 오프토픽 맥락 판별
-# =========================================================================
 def _has_offtopic_context(tokens):
-    """
-    토큰 목록(조사 제거 전 원본도 함께 넘겨받는 것이 이상적이나, 여기서는
-    이미 노이즈가 제거된 tokens 기준으로 OFFTOPIC_CONTEXT_WORDS와의 교집합을
-    확인한다. 정치/국제/연예/스포츠/학교 맥락어가 하나라도 있으면 True.
-    """
     for tok in tokens:
         if tok in _OFFTOPIC_FLAT:
             return True
@@ -363,9 +354,10 @@ def _fetch_seed_news(search_api, seed_query, pages=2, display=100, log=None):
 
 def _process_seed(search_api, category, seed_query, anchors, log=None):
     """
-    [v18.6 수정] 기사 단위로 오프토픽 맥락 여부를 먼저 확인하고,
-    해당되면 이 기사에서는 후보를 만들지 않고 건너뛴다(offtopic_skipped 집계).
-    나머지 정상 처리 흐름은 v18.5와 동일하다.
+    [v18.6] 기사 단위로 오프토픽 맥락 여부를 먼저 확인하고, 해당되면
+    이 기사에서는 후보를 만들지 않고 건너뛴다(offtopic_skipped 집계).
+    [v18.7] mentions_set/sample_titles와 함께 articles(원문 메타데이터)도
+    보존한다. URL 기준 중복 제거, 후보당 최대 5건.
     """
     news_items = _fetch_seed_news(search_api, seed_query, log=log)
     local_agg = {}
@@ -390,7 +382,7 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
             empty_skipped += 1
             continue
 
-        # [v18.6 신규] 정치/국제/연예/스포츠/학교 맥락이면 이 기사는 통째로 건너뜀
+        # [v18.6] 정치/국제/연예/스포츠/학교 맥락이면 이 기사는 통째로 건너뜀
         if _has_offtopic_context(tokens):
             offtopic_skipped += 1
             continue
@@ -406,6 +398,7 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
                     "intent_word": cand["intent_word"],
                     "mentions_set": set(),
                     "sample_titles": [],
+                    "articles": [],          # [v18.7] 기사 원문 메타데이터 보존
                     "seed_query": seed_query,
                     "first_pub_date": pub_date,
                     "latest_pub_date": pub_date,
@@ -414,6 +407,16 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
             entry["mentions_set"].add(link)
             if cleaned_title and cleaned_title not in entry["sample_titles"] and len(entry["sample_titles"]) < 5:
                 entry["sample_titles"].append(cleaned_title)
+
+            # [v18.7] articles 필드 채우기 - URL 기준 중복 제거, 후보당 최대 5개
+            if link and not any(a["url"] == link for a in entry["articles"]) and len(entry["articles"]) < 5:
+                entry["articles"].append({
+                    "title": cleaned_title,
+                    "url": link,
+                    "snippet": cleaned_desc,
+                    "date": pub_date,
+                })
+
             if cand["intent_word"] and not entry["intent_word"]:
                 entry["intent_word"] = cand["intent_word"]
             if pub_date:
@@ -436,9 +439,8 @@ def _process_seed(search_api, category, seed_query, anchors, log=None):
 def collect_candidates(search_api, discovery_target=None, light_filter_target=None,
                         log=None, max_workers=4, max_per_category=60):
     """
-    [v18.6] 반환값의 필드 구조는 v18.5와 완전히 동일하다(호환성 유지).
-    이번 버전에서 추가된 것은 오프토픽 기사 제외 로직과, 그로 인한
-    집계 로그(전체 조회 기사 수, 오프토픽 제외 수, 최종 후보 수)뿐이다.
+    [v18.7] 반환값의 필드 구조는 v18.6에 articles 필드만 추가된 것이다.
+    나머지 필드/로직은 v18.5와 완전히 동일하다(호환성 유지).
     """
     categories = discovery_target if discovery_target else list(CATEGORY_SEEDS.keys())
     categories = [c for c in categories if c in CATEGORY_SEEDS]
@@ -498,6 +500,12 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
                     for t in entry["sample_titles"]:
                         if t not in g["sample_titles"] and len(g["sample_titles"]) < 5:
                             g["sample_titles"].append(t)
+
+                    # [v18.7] articles 병합 - URL 기준 중복 제거, 최대 5개
+                    for a in entry.get("articles", []):
+                        if not any(x["url"] == a["url"] for x in g["articles"]) and len(g["articles"]) < 5:
+                            g["articles"].append(a)
+
                     if entry["intent_word"] and not g["intent_word"]:
                         g["intent_word"] = entry["intent_word"]
                     if entry["first_pub_date"] and (
@@ -527,6 +535,7 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
                 "intent_word": entry["intent_word"],
                 "mentions": len(entry["mentions_set"]),
                 "sample_titles": entry["sample_titles"],
+                "articles": entry.get("articles", []),   # [v18.7]
                 "seed_query": entry["seed_query"],
                 "first_pub_date": entry["first_pub_date"],
                 "latest_pub_date": entry["latest_pub_date"],
@@ -537,6 +546,17 @@ def collect_candidates(search_api, discovery_target=None, light_filter_target=No
             f"오프토픽(정치/국제/연예/스포츠/학교) 제외 {total_offtopic_skipped}건, "
             f"본문없음 제외 {total_empty_skipped}건")
         log(f"[collector] 최종 후보 수: {len(result)}건 (카테고리 {len(by_category)}개)")
+
+    # [v18.7] 검증용 로그 - articles 도착 확인 (log 콜백 우선, print 폴백)
+    _with_articles = [c for c in result if c.get("articles")]
+    _diag_log(f"[DIAG] articles 보유 후보 수: {len(_with_articles)} / 전체 {len(result)}", log=log)
+    if _with_articles:
+        _sample = _with_articles[0]["articles"][0]
+        _diag_log(f"[DIAG] 첫 번째 articles 샘플: {_sample}", log=log)
+        _has_tag = bool(re.search(r"</?b>", _sample.get("snippet", "") + _sample.get("title", "")))
+        _diag_log(f"[DIAG] snippet/title 내 <b> 태그 잔존 여부: {_has_tag}", log=log)
+    else:
+        _diag_log("[DIAG] articles가 채워진 후보가 없습니다. link/pub_date 값이 비어있는지 확인 필요.", log=log)
 
     return result
 
